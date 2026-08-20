@@ -124,7 +124,7 @@ data/processed/queries.jsonl
 
 ### Step 1: 准备真实图文数据
 
-先准备 100-1000 条真实图文样本，不做 toy 数据。
+先准备 100-1000 条真实图文样本。
 
 要求：
 
@@ -173,14 +173,14 @@ outputs/finetuned_full/text.index
 outputs/finetuned_full/image.index
 ```
 
-第一版使用：
+使用：
 
 ```text
 IndexHNSWFlat(M=32, efConstruction=200) + normalized embeddings
 ```
 
-HNSW 图索引运行在 CPU；Chinese-CLIP 仍在 GPU 上编码每次新查询。正式参数固定为
-`M=32`、`efConstruction=200`、`efSearch=512`，不再遍历其他查询参数。评估时从现有
+HNSW 图索引运行在 CPU；Chinese-CLIP 仍在 GPU 上编码每次新查询。正式参数为
+`M=32`、`efConstruction=200`、`efSearch=512`。评估时从现有
 embedding 在内存中临时构造 `IndexFlatIP` 真值，但不会保存 Flat 文件。
 
 质量报告只统计每路 Top-100 候选经过线上融合和图片去重后的最终 Recall@5/Recall@10，
@@ -316,26 +316,6 @@ query
 失败原因
 改进思路
 ```
-
-## 6. Current First Target
-
-当前第一阶段目标：
-
-```text
-用真实 notes.jsonl 跑通 Chinese-CLIP + FAISS GPU 的端到端搜索闭环。
-```
-
-验收标准：
-
-```text
-1. data/processed/notes.jsonl 至少有 100 条真实图文笔记
-2. outputs/note_embeddings.npy 成功生成
-3. outputs/notes.index 成功生成
-4. 输入中文 query 可以返回 top10 图文笔记
-5. 返回结果包含 note_id、title、image_path、score
-```
-
-完成后再接 BGE reranker、评估指标和 Gradio Demo。
 
 ## LoRA 微调入口
 
