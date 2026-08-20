@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import json
 from pathlib import Path
@@ -33,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index_dir", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--sample_size", type=int, default=DEFAULT_SAMPLE_SIZE)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=10,
+        help="每个独立索引加载周期评估的样本数；低内存机器建议 10",
+    )
     parser.add_argument("--candidate_pool_size", type=int, default=DEFAULT_CANDIDATE_POOL_SIZE)
     return parser.parse_args()
 
@@ -121,6 +128,7 @@ def benchmark_document_recall(
     index_dir: Path,
     sample_size: int,
     candidate_pool_size: int,
+    sample_offset: int = 0,
 ) -> dict[str, Any]:
     meta = json.loads((embedding_dir / "retrieval_meta.json").read_text(encoding="utf-8"))
     validate_retrieval_meta(meta, embedding_dir)
@@ -134,10 +142,14 @@ def benchmark_document_recall(
         rel_images, rel_docs = relation_arrays(image_assets)
     text_embeddings = np.load(embedding_dir / "text_embeddings.npy", mmap_mode="r")
     image_embeddings = np.load(embedding_dir / "image_embeddings.npy", mmap_mode="r")
-    if sample_size <= 0 or candidate_pool_size < max(FINAL_KS):
-        raise ValueError("sample_size 必须为正，candidate_pool_size 不能小于 10")
+    if sample_size <= 0 or sample_offset < 0 or candidate_pool_size < max(FINAL_KS):
+        raise ValueError("sample_size 必须为正、sample_offset 不能为负，candidate_pool_size 不能小于 10")
     rng = np.random.default_rng(20260820)
-    sample_rows = rng.choice(len(documents), size=min(sample_size, len(documents)), replace=False)
+    sample_rows = rng.permutation(len(documents))[
+        sample_offset : min(sample_offset + sample_size, len(documents))
+    ]
+    if not len(sample_rows):
+        raise ValueError("sample_offset 超出文档数量")
     modes = {"text": [], "image": [], "joint": []}
 
     query_pairs: list[tuple[np.ndarray, np.ndarray]] = []
@@ -224,6 +236,7 @@ def benchmark_document_recall(
     return {
         "schema_version": 2,
         "sample_size": len(sample_rows),
+        "sample_offset": sample_offset,
         "candidate_pool_size": candidate_pool_size,
         "ef_search": FIXED_EF_SEARCH,
         "modes": mode_metrics,
@@ -234,13 +247,82 @@ def benchmark_document_recall(
     }
 
 
+def trim_allocator() -> None:
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def benchmark_in_batches(
+    embedding_dir: Path,
+    index_dir: Path,
+    sample_size: int,
+    batch_size: int,
+    candidate_pool_size: int,
+) -> dict[str, Any]:
+    if sample_size <= 0 or batch_size <= 0:
+        raise ValueError("sample_size 和 batch_size 必须为正")
+    reports: list[dict[str, Any]] = []
+    offset = 0
+    while offset < sample_size:
+        current_size = min(batch_size, sample_size - offset)
+        report = benchmark_document_recall(
+            embedding_dir,
+            index_dir,
+            current_size,
+            candidate_pool_size,
+            sample_offset=offset,
+        )
+        reports.append(report)
+        offset += int(report["sample_size"])
+        trim_allocator()
+        print(f"benchmark batch complete: {offset}/{sample_size}", flush=True)
+        if int(report["sample_size"]) < current_size:
+            break
+
+    evaluated = sum(int(report["sample_size"]) for report in reports)
+    mode_metrics: dict[str, dict[str, float]] = {}
+    for mode in ("text", "image", "joint"):
+        mode_metrics[mode] = {
+            f"recall_at_{k}": float(
+                sum(
+                    report["modes"][mode][f"recall_at_{k}"] * int(report["sample_size"])
+                    for report in reports
+                )
+                / evaluated
+            )
+            for k in FINAL_KS
+        }
+    return {
+        "schema_version": 2,
+        "sample_size": evaluated,
+        "batch_size": batch_size,
+        "sample_selection": "seed_20260820_permutation_prefix",
+        "candidate_pool_size": candidate_pool_size,
+        "ef_search": FIXED_EF_SEARCH,
+        "modes": mode_metrics,
+        "overall": {
+            f"recall_at_{k}": float(
+                np.mean([mode_metrics[mode][f"recall_at_{k}"] for mode in mode_metrics])
+            )
+            for k in FINAL_KS
+        },
+    }
+
+
 def main() -> int:
     args = parse_args()
     embedding_dir = Path(args.embedding_dir)
     index_dir = Path(args.index_dir or args.embedding_dir)
     output = Path(args.output or embedding_dir / "hnsw_document_benchmark.json")
-    report = benchmark_document_recall(
-        embedding_dir, index_dir, args.sample_size, args.candidate_pool_size
+    report = benchmark_in_batches(
+        embedding_dir,
+        index_dir,
+        args.sample_size,
+        args.batch_size,
+        args.candidate_pool_size,
     )
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))

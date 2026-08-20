@@ -230,6 +230,8 @@ python src/hnsw_final_benchmark.py \
   --candidate_pool_size 100
 ```
 
+benchmark 默认以 10 篇为一批，分阶段加载文本和图片索引，再按固定随机排列汇总 100 篇结果；这样约 2 GB 内存的环境也不需要同时常驻两份索引。可通过 `--batch_size` 调整。
+
 轻量回归测试：
 
 ```bash

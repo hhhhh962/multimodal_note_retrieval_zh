@@ -20,7 +20,12 @@ from src.document_retrieval import (
     exact_score_documents,
 )
 from src.document_schema import retrieval_manifest_hash
-from src.hnsw_final_benchmark import exact_all_document_scores, recall_at_k, top_rows
+from src.hnsw_final_benchmark import (
+    benchmark_in_batches,
+    exact_all_document_scores,
+    recall_at_k,
+    top_rows,
+)
 from src.search_pipeline import SearchPipeline
 
 
@@ -237,6 +242,35 @@ class DocumentRetrievalTests(unittest.TestCase):
 
     def test_recall(self) -> None:
         self.assertEqual(recall_at_k([0, 1, 2], [0, 2, 3], 2), 0.5)
+
+    def test_benchmark_batches_use_disjoint_offsets_and_weight_metrics(self) -> None:
+        reports = [
+            {
+                "sample_size": 2,
+                "modes": {
+                    mode: {"recall_at_5": 1.0, "recall_at_10": 0.5}
+                    for mode in ("text", "image", "joint")
+                },
+            },
+            {
+                "sample_size": 1,
+                "modes": {
+                    mode: {"recall_at_5": 0.0, "recall_at_10": 1.0}
+                    for mode in ("text", "image", "joint")
+                },
+            },
+        ]
+        with patch(
+            "src.hnsw_final_benchmark.benchmark_document_recall",
+            side_effect=reports,
+        ) as mocked:
+            result = benchmark_in_batches(Path("e"), Path("i"), 3, 2, 100)
+        self.assertEqual(
+            [call.kwargs["sample_offset"] for call in mocked.call_args_list],
+            [0, 2],
+        )
+        self.assertAlmostEqual(result["overall"]["recall_at_5"], 2 / 3)
+        self.assertAlmostEqual(result["overall"]["recall_at_10"], 2 / 3)
 
 
 class PipelineIndexLoadingTests(unittest.TestCase):
