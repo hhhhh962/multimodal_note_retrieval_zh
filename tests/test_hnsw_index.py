@@ -74,6 +74,48 @@ class HnswBuildTests(unittest.TestCase):
             self.assertEqual(info["graph_build_storage"], "sq_fp16")
             self.assertEqual(info["final_storage"], "flat_float32")
 
+    def test_resumes_from_valid_spooled_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vectors = normalized([[1, 0], [0, 1], [1, 1], [-1, 0]])
+            np.save(root / "vectors.npy", vectors)
+            graph = faiss.IndexHNSWSQ(
+                2,
+                faiss.ScalarQuantizer.QT_fp16,
+                8,
+                faiss.METRIC_INNER_PRODUCT,
+            )
+            graph.hnsw.efConstruction = 40
+            graph.add(vectors)
+            scratch = root / ".vectors.hnsw_graph.tmp"
+            scratch.mkdir()
+            for name in (
+                "levels",
+                "offsets",
+                "neighbors",
+                "cum_nneighbor_per_level",
+                "assign_probas",
+            ):
+                np.save(scratch / f"{name}.npy", faiss.vector_to_array(getattr(graph.hnsw, name)))
+
+            build_one(
+                root / "vectors.npy",
+                root / "vectors.index",
+                2,
+                8,
+                40,
+                4,
+                2,
+                low_memory_build=True,
+                resume_spooled_graph=True,
+            )
+            index = faiss.read_index(str(root / "vectors.index"))
+            scores, ids = index.search(vectors, 1)
+            self.assertEqual(ids[:, 0].tolist(), [0, 1, 2, 3])
+            self.assertTrue(np.allclose(scores[:, 0], 1.0, atol=1e-5))
+            self.assertEqual(index.hnsw.efConstruction, 40)
+            self.assertFalse(scratch.exists())
+
     def test_rejects_invalid_parameters(self) -> None:
         args = argparse.Namespace(
             chunk_size=1,

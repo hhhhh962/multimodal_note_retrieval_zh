@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="用 FP16 SQ 仅构建 HNSW 图，再装配标准 float32 IndexHNSWFlat",
     )
+    parser.add_argument(
+        "--resume_text_spooled_graph",
+        action="store_true",
+        help="复用 .text_embeddings.hnsw_graph.tmp 中已转存的文本 HNSW 图",
+    )
     parser.add_argument("--replace_existing", action="store_true")
     # Retained for CLI compatibility; benchmarking is now an explicit separate step.
     parser.add_argument("--benchmark_sample_size", type=int, default=DEFAULT_SAMPLE_SIZE)
@@ -121,6 +126,7 @@ def build_one(
     expected_dimension: int | None = None,
     normalization: str = "l2",
     low_memory_build: bool = False,
+    resume_spooled_graph: bool = False,
 ) -> dict[str, Any]:
     embeddings = np.load(embedding_path, mmap_mode="r")
     if embeddings.ndim != 2:
@@ -132,7 +138,20 @@ def build_one(
         raise ValueError(f"{embedding_path.name} dimension={dimension}，期望 {expected_dimension}")
     if str(normalization).lower() != "l2":
         raise ValueError("HNSW 内积索引只支持 l2 归一化向量")
-    if low_memory_build:
+    if resume_spooled_graph and not low_memory_build:
+        raise ValueError("恢复转存图要求同时启用 low_memory_build")
+    scratch_dir = index_path.with_name(f".{embedding_path.stem}.hnsw_graph.tmp")
+    started = time.perf_counter()
+    if resume_spooled_graph:
+        index = assemble_flat_hnsw_from_spool(
+            embeddings,
+            dimension,
+            hnsw_m,
+            count,
+            scratch_dir,
+            ef_construction,
+        )
+    elif low_memory_build:
         index = faiss.IndexHNSWSQ(
             dimension,
             faiss.ScalarQuantizer.QT_fp16,
@@ -141,21 +160,21 @@ def build_one(
         )
     else:
         index = faiss.IndexHNSWFlat(dimension, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
-    index.hnsw.efConstruction = int(ef_construction)
-    index.hnsw.efSearch = FIXED_EF_SEARCH
-    started = time.perf_counter()
-    add_embeddings(index, embeddings, int(chunk_size), embedding_path.stem)
-    if int(index.ntotal) != count:
-        raise RuntimeError("HNSW ntotal 与 embedding 数量不一致")
-    if low_memory_build:
-        index = assemble_flat_hnsw(
-            index,
-            embeddings,
-            dimension,
-            hnsw_m,
-            count,
-            index_path.with_name(f".{embedding_path.stem}.hnsw_graph.tmp"),
-        )
+    if not resume_spooled_graph:
+        index.hnsw.efConstruction = int(ef_construction)
+        index.hnsw.efSearch = FIXED_EF_SEARCH
+        add_embeddings(index, embeddings, int(chunk_size), embedding_path.stem)
+        if int(index.ntotal) != count:
+            raise RuntimeError("HNSW ntotal 与 embedding 数量不一致")
+        if low_memory_build:
+            index = assemble_flat_hnsw(
+                index,
+                embeddings,
+                dimension,
+                hnsw_m,
+                count,
+                scratch_dir,
+            )
     faiss.write_index(index, str(index_path))
     del index
     gc.collect()
@@ -194,53 +213,109 @@ def assemble_flat_hnsw(
         "cum_nneighbor_per_level",
         "assign_probas",
     )
-    scalar_fields = (
-        "entry_point",
-        "max_level",
-        "efConstruction",
-        "efSearch",
-        "check_relative_distance",
-        "search_bounded_queue",
-    )
     if scratch_dir.exists():
         raise FileExistsError(f"发现遗留 HNSW 图临时目录：{scratch_dir}")
     scratch_dir.mkdir(parents=True)
-    try:
-        graph_scalars = {name: getattr(graph_index.hnsw, name) for name in scalar_fields}
-        graph_storage = faiss.downcast_index(graph_index.storage)
-        graph_storage.reset()
-        del graph_storage
+    graph_ef_construction = int(graph_index.hnsw.efConstruction)
+    graph_storage = faiss.downcast_index(graph_index.storage)
+    graph_storage.reset()
+    del graph_storage
+    trim_allocator()
+    print("临时 SQ 向量已释放，正在把 HNSW 邻接图逐字段转存到磁盘", flush=True)
+    for name in vector_fields:
+        values = faiss.vector_to_array(getattr(graph_index.hnsw, name))
+        np.save(scratch_dir / f"{name}.npy", values)
+        del values
         trim_allocator()
-        print("临时 SQ 向量已释放，正在把 HNSW 邻接图逐字段转存到磁盘", flush=True)
-        for name in vector_fields:
-            values = faiss.vector_to_array(getattr(graph_index.hnsw, name))
-            np.save(scratch_dir / f"{name}.npy", values)
-            del values
-            trim_allocator()
-        del graph_index
-        trim_allocator()
+    del graph_index
+    trim_allocator()
+    return assemble_flat_hnsw_from_spool(
+        embeddings,
+        dimension,
+        hnsw_m,
+        count,
+        scratch_dir,
+        ef_construction=graph_ef_construction,
+    )
 
-        print("正在装配标准 float32 IndexHNSWFlat", flush=True)
+
+def assemble_flat_hnsw_from_spool(
+    embeddings: np.ndarray,
+    dimension: int,
+    hnsw_m: int,
+    count: int,
+    scratch_dir: Path,
+    ef_construction: int | None,
+) -> faiss.Index:
+    """Assemble a standard float32 HNSW index from a validated disk-spooled graph."""
+
+    vector_fields = (
+        "levels",
+        "offsets",
+        "neighbors",
+        "cum_nneighbor_per_level",
+        "assign_probas",
+    )
+    missing = [name for name in vector_fields if not (scratch_dir / f"{name}.npy").is_file()]
+    if missing:
+        raise FileNotFoundError(f"HNSW 图临时目录缺少字段：{', '.join(missing)}")
+
+    levels = np.load(scratch_dir / "levels.npy", mmap_mode="r")
+    offsets = np.load(scratch_dir / "offsets.npy", mmap_mode="r")
+    neighbors = np.load(scratch_dir / "neighbors.npy", mmap_mode="r")
+    if levels.shape != (count,):
+        raise ValueError(f"转存图 levels 形状 {levels.shape}，期望 {(count,)}")
+    if offsets.shape != (count + 1,):
+        raise ValueError(f"转存图 offsets 形状 {offsets.shape}，期望 {(count + 1,)}")
+    if neighbors.ndim != 1 or int(offsets[-1]) != int(neighbors.size):
+        raise ValueError("转存图 offsets 末值与 neighbors 长度不一致")
+    if count and (int(levels.min()) < 1 or int(levels.max()) < 1):
+        raise ValueError("转存图包含无效 HNSW level")
+    max_level = int(levels.max()) - 1 if count else -1
+    entry_point = int(np.argmax(levels)) if count else -1
+    del levels, offsets, neighbors
+
+    success = False
+    try:
+        print("正在从磁盘转存图装配标准 float32 IndexHNSWFlat", flush=True)
         final = faiss.IndexHNSWFlat(dimension, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
         storage = faiss.downcast_index(final.storage)
+        byte_count = count * dimension * np.dtype("float32").itemsize
+        storage.codes.resize(byte_count)
+        raw_codes = faiss.rev_swig_ptr(storage.codes.data(), storage.codes.size())
+        flat_vectors = raw_codes.view("float32").reshape(count, dimension)
         for start in range(0, count, 5000):
             end = min(start + 5000, count)
-            storage.add(np.ascontiguousarray(embeddings[start:end], dtype="float32"))
-        if int(storage.ntotal) != count:
-            raise RuntimeError("装配后的 IndexFlat 存储数量不一致")
+            flat_vectors[start:end] = embeddings[start:end]
+        del flat_vectors, raw_codes
+        storage.ntotal = count
         final.ntotal = count
+
+        expected_cum = faiss.vector_to_array(final.hnsw.cum_nneighbor_per_level)
+        spooled_cum = np.load(scratch_dir / "cum_nneighbor_per_level.npy", mmap_mode="r")
+        if not np.array_equal(expected_cum, spooled_cum):
+            raise ValueError("转存图的邻居层配置与 hnsw_m 不匹配")
+        del expected_cum, spooled_cum
         for name in vector_fields:
             values = np.load(scratch_dir / f"{name}.npy", mmap_mode="r")
             faiss.copy_array_to_vector(values, getattr(final.hnsw, name))
             del values
             trim_allocator()
-        for name, value in graph_scalars.items():
-            setattr(final.hnsw, name, value)
+        final.hnsw.entry_point = entry_point
+        final.hnsw.max_level = max_level
+        final.hnsw.efConstruction = int(
+            DEFAULT_EF_CONSTRUCTION if ef_construction is None else ef_construction
+        )
+        final.hnsw.efSearch = FIXED_EF_SEARCH
+        final.hnsw.check_relative_distance = True
+        final.hnsw.search_bounded_queue = True
         if int(final.hnsw.offsets.size()) != count + 1:
             raise RuntimeError("装配后的 HNSW offsets 数量不一致")
+        success = True
         return final
     finally:
-        shutil.rmtree(scratch_dir, ignore_errors=True)
+        if success:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 def trim_allocator() -> None:
@@ -295,6 +370,7 @@ def main() -> int:
             expected_dimension=dimension,
             normalization=meta["normalization"],
             low_memory_build=args.low_memory_build,
+            resume_spooled_graph=args.resume_text_spooled_graph,
         )
         image_info = build_one(
             embedding_dir / "image_embeddings.npy",

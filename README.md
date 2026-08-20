@@ -158,6 +158,8 @@ python src/build_faiss_index.py \
 
 内存只有约 2GB 时可增加 `--low_memory_build --faiss_threads 1 --chunk_size 5000`。该模式仅在建图阶段用 FP16 scalar-quantized 存储降低峰值，随后把邻接图装配回完整 float32 `IndexHNSWFlat`；`index_meta.json` 会同时记录建图存储与最终存储。应通过下文 benchmark 验证近似召回保持率。
 
+如果文本建图已经完成转存、但在最终装配时进程中断，可在上述参数后增加 `--resume_text_spooled_graph`，复用输出目录中的 `.text_embeddings.hnsw_graph.tmp`；恢复成功后该临时目录会自动删除。
+
 ### 4. 检索
 
 文本查询：
