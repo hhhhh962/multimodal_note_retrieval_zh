@@ -54,14 +54,13 @@ def parse_args() -> argparse.Namespace:
 
 def print_text_results(results: List[dict]) -> None:
     """
-    按适合终端阅读的格式打印搜索结果（文档级，MUGE 多图聚合）。
+    按适合终端阅读的格式打印文档级搜索结果。
     """
     """逐条输出最终结果。"""
     for rank, row in enumerate(results, start=1):
         """打印排名、综合分、两类索引分和类型。"""
-        doc_type = row.get("type", "single")
-        item_count = row.get("item_count", 1)
-        type_label = f"聚合({item_count}图)" if doc_type == "aggregated" else "独立"
+        image_count = int(row.get("image_count", len(row.get("image_paths", []))))
+        type_label = f"完整笔记({image_count}图)"
         print(
             f"排名={rank:02d} 综合分={row['score_mm']:.4f} "
             f"文本索引分={row['score_text_index']:.4f} 图片索引分={row['score_image_index']:.4f} "
@@ -71,7 +70,7 @@ def print_text_results(results: List[dict]) -> None:
         )
         """打印候选文本。"""
         print(f"    文本: {row.get('text')}")
-        """打印候选图片路径（MUGE 聚合可能有多张）。"""
+        """打印这篇笔记的完整图片路径。"""
         image_paths = row.get("image_paths", [])
         if len(image_paths) == 1:
             print(f"    图片: {image_paths[0]}")

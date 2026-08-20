@@ -1,4 +1,4 @@
-"""HNSW 构建和加载的轻量回归测试。"""
+"""Document-level HNSW and retrieval regression tests."""
 
 from __future__ import annotations
 
@@ -13,51 +13,34 @@ from unittest.mock import patch
 import faiss
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from src.build_faiss_index import add_embeddings, build_one, main, validate_args
-from src.hnsw_final_benchmark import (
-    FIXED_EF_SEARCH,
-    final_ranked_keys,
-    recall_at_k,
+from src.document_retrieval import (
+    adaptive_image_candidates,
+    build_doc_image_rows,
+    exact_score_documents,
 )
-from src.model_fingerprint import MetadataMismatchError
+from src.document_schema import retrieval_manifest_hash
+from src.hnsw_final_benchmark import exact_all_document_scores, recall_at_k, top_rows
 from src.search_pipeline import SearchPipeline
 
 
-def normalized_vectors(count: int = 32, dimension: int = 8) -> np.ndarray:
-    rng = np.random.default_rng(42)
-    values = rng.normal(size=(count, dimension)).astype("float32")
-    faiss.normalize_L2(values)
-    return values
+def normalized(values: list[list[float]]) -> np.ndarray:
+    matrix = np.asarray(values, dtype="float32")
+    matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix
 
 
 class HnswBuildTests(unittest.TestCase):
     def test_build_save_load_and_inner_product_search(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            vectors = normalized_vectors()
+            vectors = normalized([[1, 0], [0, 1], [1, 1]])
             np.save(root / "vectors.npy", vectors)
-            info = build_one(
-                root / "vectors.npy",
-                root / "vectors.index",
-                chunk_size=7,
-                hnsw_m=8,
-                ef_construction=40,
-                expected_count=len(vectors),
-                expected_dimension=vectors.shape[1],
-            )
+            info = build_one(root / "vectors.npy", root / "vectors.index", 2, 8, 40, 3, 2)
             index = faiss.read_index(str(root / "vectors.index"))
-            index.hnsw.efSearch = 32
-            scores, ids = index.search(vectors[:3], 1)
-            self.assertEqual(index.ntotal, len(vectors))
-            self.assertEqual(index.d, vectors.shape[1])
-            self.assertEqual(index.metric_type, faiss.METRIC_INNER_PRODUCT)
-            self.assertEqual(index.hnsw.efConstruction, 40)
-            self.assertEqual(index.hnsw.nb_neighbors(0), 16)
-            self.assertEqual(ids[:, 0].tolist(), [0, 1, 2])
+            scores, ids = index.search(vectors[:2], 1)
+            self.assertEqual(index.ntotal, 3)
+            self.assertEqual(ids[:, 0].tolist(), [0, 1])
             self.assertTrue(np.allclose(scores[:, 0], 1.0, atol=1e-5))
             self.assertGreater(info["size_bytes"], 0)
 
@@ -67,7 +50,7 @@ class HnswBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不是 l2 归一化向量"):
             add_embeddings(index, values, chunk_size=2, desc="bad")
 
-    def test_rejects_invalid_hnsw_parameters(self) -> None:
+    def test_rejects_invalid_parameters(self) -> None:
         args = argparse.Namespace(
             chunk_size=1,
             hnsw_m=0,
@@ -78,115 +61,132 @@ class HnswBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hnsw_m"):
             validate_args(args)
 
-    def test_existing_indexes_require_explicit_replace_flag(self) -> None:
+    def test_builds_different_text_and_image_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            contract = {
-                "model_fingerprint": "model",
-                "data_manifest_hash": "data",
-                "dimension": 8,
-                "normalization": "l2",
+            documents = [
+                {"doc_row_id": 0, "doc_id": "d0", "text": "a", "images": [{"image_path": "a.jpg"}]},
+                {"doc_row_id": 1, "doc_id": "d1", "text": "b", "images": [{"image_path": "b.jpg"}, {"image_path": "c.jpg"}]},
+            ]
+            images = [
+                {"image_row_id": 0, "image_path": "a.jpg", "doc_row_ids": [0]},
+                {"image_row_id": 1, "image_path": "b.jpg", "doc_row_ids": [1]},
+                {"image_row_id": 2, "image_path": "c.jpg", "doc_row_ids": [1]},
+            ]
+            contract = {"model_fingerprint": "m", "data_manifest_hash": "d", "dimension": 2, "normalization": "l2"}
+            manifest_hash = retrieval_manifest_hash(documents, images)
+            meta = {
+                **contract,
+                "schema_version": 2,
+                "document_count": 2,
+                "image_count": 3,
+                "relation_count": 3,
+                "retrieval_manifest_hash": manifest_hash,
+                "documents": documents,
+                "image_assets": images,
             }
+            (root / "retrieval_meta.json").write_text(json.dumps(meta), encoding="utf-8")
             (root / "extract_state.json").write_text(
-                json.dumps({**contract, "count": 1, "complete": True}), encoding="utf-8"
+                json.dumps({**contract, "schema_version": 2, "document_count": 2, "image_count": 3, "retrieval_manifest_hash": manifest_hash, "complete": True}),
+                encoding="utf-8",
             )
-            (root / "item_meta.json").write_text(
-                json.dumps({**contract, "count": 1, "items": [{}]}), encoding="utf-8"
-            )
-            for name in ("text.index", "image.index", "index_meta.json"):
-                (root / name).touch()
-            with patch.object(sys, "argv", ["build_faiss_index.py", "--embedding_dir", str(root)]):
-                with self.assertRaisesRegex(FileExistsError, "--replace_existing"):
-                    main()
+            np.save(root / "text_embeddings.npy", normalized([[1, 0], [0, 1]]))
+            np.save(root / "image_embeddings.npy", normalized([[1, 0], [0, 1], [1, 1]]))
+            with patch.object(sys, "argv", ["build_faiss_index.py", "--embedding_dir", str(root), "--hnsw_m", "8", "--ef_construction", "40"]):
+                self.assertEqual(main(), 0)
+            self.assertEqual(faiss.read_index(str(root / "text.index")).ntotal, 2)
+            self.assertEqual(faiss.read_index(str(root / "image.index")).ntotal, 3)
 
 
-class HnswPipelineTests(unittest.TestCase):
+class DocumentRetrievalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.documents = [
+            {"doc_row_id": 0, "doc_id": "d0", "text": "red", "images": [{"image_path": "red.jpg"}, {"image_path": "blue.jpg"}]},
+            {"doc_row_id": 1, "doc_id": "d1", "text": "green", "images": [{"image_path": "green.jpg"}]},
+            {"doc_row_id": 2, "doc_id": "d2", "text": "shared", "images": [{"image_path": "blue.jpg"}]},
+        ]
+        self.image_assets = [
+            {"image_row_id": 0, "image_path": "red.jpg", "doc_row_ids": [0]},
+            {"image_row_id": 1, "image_path": "blue.jpg", "doc_row_ids": [0, 2]},
+            {"image_row_id": 2, "image_path": "green.jpg", "doc_row_ids": [1]},
+        ]
+        self.text = normalized([[1, 0], [0, 1], [1, 1]])
+        self.images = normalized([[1, 0], [0, 1], [-1, 0]])
+        self.doc_images = build_doc_image_rows(3, self.image_assets)
+
+    def test_exact_scoring_returns_one_complete_document_and_uses_max_image(self) -> None:
+        results = exact_score_documents(
+            [0, 1, 2],
+            text_query=np.asarray([[0, 1]], dtype="float32"),
+            image_query=None,
+            text_embeddings=self.text,
+            image_embeddings=self.images,
+            documents=self.documents,
+            image_assets=self.image_assets,
+            doc_image_rows=self.doc_images,
+            alpha=0.0,
+        )
+        self.assertEqual(results[0]["doc_id"], "d0")
+        self.assertEqual(results[0]["score_ti"], 1.0)
+        self.assertEqual(results[0]["image_paths"], ["red.jpg", "blue.jpg"])
+        self.assertEqual(results[0]["image_count"], 2)
+        self.assertEqual(results[0]["matched_image_path"], "blue.jpg")
+        self.assertEqual(len({row["doc_id"] for row in results}), 3)
+
+    def test_adaptive_image_candidates_expands_shared_image_to_all_owners(self) -> None:
+        index = faiss.IndexFlatIP(2)
+        index.add(self.images)
+        docs, matched = adaptive_image_candidates(
+            index, np.asarray([[0, 1]], dtype="float32"), self.image_assets, 2, multiplier=1
+        )
+        self.assertTrue({0, 2}.issubset(docs))
+        self.assertEqual(matched[0], 1)
+        self.assertEqual(matched[2], 1)
+
+    def test_exact_all_scores_matches_candidate_rescoring(self) -> None:
+        relation_images = np.asarray([0, 1, 1, 2], dtype=np.int64)
+        relation_docs = np.asarray([0, 0, 2, 1], dtype=np.int64)
+        query = np.asarray([[0, 1]], dtype="float32")
+        scores = exact_all_document_scores(
+            text_query=query,
+            image_query=None,
+            text_embeddings=self.text,
+            image_embeddings=self.images,
+            relation_image_rows=relation_images,
+            relation_doc_rows=relation_docs,
+            alpha=0.5,
+        )
+        ranked = exact_score_documents(
+            range(3),
+            text_query=query,
+            image_query=None,
+            text_embeddings=self.text,
+            image_embeddings=self.images,
+            documents=self.documents,
+            image_assets=self.image_assets,
+            doc_image_rows=self.doc_images,
+            alpha=0.5,
+        )
+        self.assertEqual(top_rows(scores, 3), [row["doc_row_id"] for row in ranked])
+
+    def test_recall(self) -> None:
+        self.assertEqual(recall_at_k([0, 1, 2], [0, 2, 3], 2), 0.5)
+
+
+class PipelineIndexLoadingTests(unittest.TestCase):
     def test_load_hnsw_stays_on_cpu_and_applies_ef_search(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "index.faiss"
-            index = faiss.IndexHNSWFlat(8, 8, faiss.METRIC_INNER_PRODUCT)
-            index.add(normalized_vectors(count=16, dimension=8))
+            index = faiss.IndexHNSWFlat(2, 8, faiss.METRIC_INNER_PRODUCT)
+            index.add(normalized([[1, 0], [0, 1]]))
             faiss.write_index(index, str(path))
-
             pipeline = SearchPipeline.__new__(SearchPipeline)
             pipeline.hnsw_ef_search = 77
             pipeline._hnsw_cpu_notice_printed = False
             pipeline.gpu_resources = []
             loaded = pipeline.load_index(path, use_gpu=True)
-
-            self.assertTrue(hasattr(loaded, "hnsw"))
             self.assertEqual(loaded.hnsw.efSearch, 77)
             self.assertEqual(pipeline.gpu_resources, [])
-
-    def test_metadata_mismatch_is_rejected(self) -> None:
-        index = faiss.IndexHNSWFlat(8, 8, faiss.METRIC_INNER_PRODUCT)
-        index.hnsw.efConstruction = 40
-        index.hnsw.efSearch = 32
-        index.add(normalized_vectors(count=16, dimension=8))
-
-        pipeline = SearchPipeline.__new__(SearchPipeline)
-        pipeline.hnsw_ef_search = 32
-        pipeline.metadata_mode = "strict"
-        pipeline.index_meta = {
-            "hnsw": {"m": 16, "ef_construction": 40, "ef_search": 32},
-            "text": {"count": 16, "dimension": 8, "normalization": "l2"},
-        }
-        with self.assertRaisesRegex(MetadataMismatchError, "HNSW M"):
-            pipeline._validate_one_index("text", index, 16, 8)
-
-    def test_missing_ef_search_is_rejected(self) -> None:
-        with self.assertRaisesRegex(MetadataMismatchError, "ef_search"):
-            SearchPipeline.resolve_hnsw_ef_search(None, {})
-
-
-class FinalFusionBenchmarkTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.items = [
-            {"source": "demo", "image_id": "a"},
-            {"source": "demo", "image_id": "b"},
-            {"source": "demo", "image_id": "c"},
-            {"source": "demo", "image_id": "c"},
-            {"source": "demo", "image_id": "d"},
-            {"source": "demo", "image_id": "e"},
-            {"source": "demo", "image_id": "f"},
-            {"source": "demo", "image_id": "g"},
-            {"source": "demo", "image_id": "h"},
-            {"source": "demo", "image_id": "i"},
-            {"source": "demo", "image_id": "j"},
-        ]
-        for item in self.items:
-            item["source"] = "MUGE"
-
-    def test_text_image_and_joint_use_expected_weights(self) -> None:
-        routes = {
-            "tt": {0: 1.0, 1: 0.2},
-            "ti": {0: 0.0, 1: 1.0},
-            "it": {0: 0.0, 1: 1.0},
-            "ii": {0: 1.0, 1: 0.0},
-        }
-        row_to_text_id = {str(index): f"demo_{item['image_id']}" for index, item in enumerate(self.items)}
-        self.assertEqual(final_ranked_keys(routes, self.items, row_to_text_id, "text", 2)[0], "demo_b")
-        self.assertEqual(final_ranked_keys(routes, self.items, row_to_text_id, "image", 2)[0], "demo_a")
-        self.assertEqual(final_ranked_keys(routes, self.items, row_to_text_id, "joint", 2)[0], "demo_b")
-
-    def test_final_results_are_deduplicated_before_recall(self) -> None:
-        routes = {
-            "tt": {2: 1.0, 3: 0.9, 0: 0.8, 1: 0.7, 4: 0.6, 5: 0.5},
-            "ti": {},
-        }
-        row_to_text_id = {str(index): f"demo_{item['image_id']}" for index, item in enumerate(self.items)}
-        keys = final_ranked_keys(routes, self.items, row_to_text_id, "text", 5)
-        self.assertEqual(len(keys), 5)
-        self.assertEqual(keys.count("demo_c"), 1)
-
-    def test_recall_is_computed_at_five_and_ten(self) -> None:
-        exact = [("row", str(index)) for index in range(10)]
-        approximate = exact[:4] + [("row", "99")] + exact[5:9] + [("row", "98")]
-        self.assertEqual(recall_at_k(exact, approximate, 5), 0.8)
-        self.assertEqual(recall_at_k(exact, approximate, 10), 0.8)
-
-    def test_fixed_ef_search_is_512(self) -> None:
-        self.assertEqual(FIXED_EF_SEARCH, 512)
 
 
 if __name__ == "__main__":

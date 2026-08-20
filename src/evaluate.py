@@ -31,8 +31,7 @@ FIELDNAMES = [
     "query",
     "rank",
     "doc_id",
-    "type",
-    "item_count",
+    "image_count",
     "text",
     "best_image_path",
     "image_paths",
@@ -54,7 +53,7 @@ BAD_CASE_FIELDNAMES = [
     "query",
     "rank",
     "doc_id",
-    "type",
+    "image_count",
     "text",
     "best_image_path",
     "score_mm",
@@ -223,7 +222,7 @@ def rounded(value: Any, digits: int = 6) -> Any:
 
 def candidate_row(query_obj: dict, rank: int, result: dict, latency_ms: float) -> dict:
     """
-    把搜索结果整理成待标注记录（文档级，MUGE 多图聚合）。
+    把文档级搜索结果整理成待标注记录。
     """
     """按固定字段构造输出行。"""
     return {
@@ -231,8 +230,7 @@ def candidate_row(query_obj: dict, rank: int, result: dict, latency_ms: float) -
         "query": query_obj.get("query"),
         "rank": rank,
         "doc_id": result.get("doc_id"),
-        "type": result.get("type", "single"),
-        "item_count": result.get("item_count", 1),
+        "image_count": result.get("image_count", len(result.get("image_paths", []))),
         "text": result.get("text"),
         "best_image_path": result.get("best_image_path"),
         "image_paths": json.dumps(result.get("image_paths", []), ensure_ascii=False),
@@ -461,7 +459,7 @@ def build_bad_cases(rows: List[dict]) -> List[dict]:
                 "query": row.get("query"),
                 "rank": row.get("rank"),
                 "doc_id": row.get("doc_id"),
-                "type": row.get("type"),
+                "image_count": row.get("image_count"),
                 "text": row.get("text"),
                 "best_image_path": row.get("best_image_path"),
                 "score_mm": row.get("score_mm"),
@@ -607,7 +605,7 @@ def command_score(args: argparse.Namespace) -> int:
         "ndcg_at_10": mean([row["ndcg_at_10"] for row in per_query]),
         "avg_latency_ms": mean([row["avg_latency_ms"] for row in per_query]),
         "p95_latency_ms": percentile([row["avg_latency_ms"] for row in per_query], 0.95),
-        "latency_note": "avg_latency_ms 不包含模型、processor、FAISS 索引和 item_meta 的初始化时间，只统计 pipeline 常驻后的单 query 搜索时间。",
+        "latency_note": "avg_latency_ms 不包含模型、processor、FAISS 索引和 retrieval_meta 的初始化时间，只统计 pipeline 常驻后的单 query 搜索时间。",
     }
     """生成候选级 bad cases。"""
     bad_cases = build_bad_cases(rows)
@@ -664,7 +662,7 @@ def write_summary(path: str | Path, metrics: dict, per_query: List[dict], bad_qu
         f"- Bad Cases 数：{metrics.get('num_bad_cases', 0)}",
         f"- Bad Queries 数：{metrics.get('num_bad_queries', 0)}",
         "",
-        "说明：平均检索耗时不包含模型、processor、FAISS 索引和 item_meta 的初始化时间，只统计 pipeline 常驻后的单 query 搜索时间。",
+        "说明：平均检索耗时不包含模型、processor、FAISS 索引和 retrieval_meta 的初始化时间，只统计 pipeline 常驻后的单 query 搜索时间。",
         "",
         "## 逐 Query 指标",
         "",

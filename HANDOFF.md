@@ -26,12 +26,22 @@ CONFIG=/path/to/finetune_lora.yaml bash scripts/run_finetune_lora.sh
 
 ## 工作流
 
-1. 使用 `scripts/prepare_retrieval_datasets.py` 准备检索数据。
+1. 使用 `src/prepare_demo_items.py` 生成 `documents.jsonl`。
 2. 使用 `scripts/run_finetune_lora.sh` 启动 LoRA 微调。
 3. 使用 `scripts/show_finetune_progress.sh` 查看进度。
 4. 使用 `scripts/run_finetune_eval.sh` 评估最佳 checkpoint。
 5. 使用 `scripts/run_finetune_export.sh` 导出合并模型。
 6. 使用 `scripts/run_rebuild_finetuned.sh` 重建向量与索引。
+
+检索单位是完整笔记。默认 v2 目录为 `outputs/finetuned_docs_v2`：文本索引按笔记建行，图片索引按唯一图片建行。旧 `outputs/finetuned_full` 是只读的 pair-level 产物，迁移时使用：
+
+```bash
+python scripts/migrate_pair_artifacts.py \
+  --source-dir outputs/finetuned_full \
+  --items data/processed/demo/items.jsonl \
+  --output-dir outputs/finetuned_docs_v2
+python src/build_faiss_index.py --embedding_dir outputs/finetuned_docs_v2
+```
 
 脚本默认自动定位仓库根目录并使用当前环境的 `python`。可通过 `PROJECT_DIR`、`PYTHON`、`CONFIG`、`OUTPUT_DIR` 等环境变量覆盖。
 

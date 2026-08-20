@@ -8,7 +8,6 @@
 """引入系统环境工具，用来读取模型目录等运行配置。"""
 import os
 """引入告警工具，用于提示仍可读取但没有新签名字段的老 baseline。"""
-import warnings
 """引入结构化文本工具，用来调试和序列化结果。"""
 import json
 """引入路径对象，方便解析项目内图片和索引路径。"""
@@ -39,7 +38,13 @@ try:
         compute_model_fingerprint,
     )
     from utils import load_json, resolve_path
-    from muge_aggregation import aggregate_results, load_muge_mapping
+    from document_schema import validate_retrieval_meta
+    from document_retrieval import (
+        adaptive_image_candidates,
+        build_doc_image_rows,
+        collect_faiss_scores,
+        exact_score_documents,
+    )
 except ImportError:
     """app.py 从项目根目录导入 src.search_pipeline 时使用这个导入路径。"""
     from src.model_fingerprint import (
@@ -49,12 +54,18 @@ except ImportError:
         compute_model_fingerprint,
     )
     from src.utils import load_json, resolve_path
-    from src.muge_aggregation import aggregate_results, load_muge_mapping
+    from src.document_schema import validate_retrieval_meta
+    from src.document_retrieval import (
+        adaptive_image_candidates,
+        build_doc_image_rows,
+        collect_faiss_scores,
+        exact_score_documents,
+    )
 
 
 """记录当前正式部署使用的微调模型和全量索引默认路径。"""
 DEFAULT_MODEL_DIR = "outputs/finetune_lora/exported_model"
-DEFAULT_EMBEDDING_DIR = "outputs/finetuned_full"
+DEFAULT_EMBEDDING_DIR = "outputs/finetuned_docs_v2"
 
 
 class SearchPipeline:
@@ -102,14 +113,14 @@ class SearchPipeline:
         self.device = self.choose_device(device)
         """保存 FAISS 显卡资源对象，避免显卡索引依赖的资源被回收。"""
         self.gpu_resources = []
-        """加载样本元信息，搜索结果需要通过 row_id 回查文本和图片。"""
-        self.meta = self.load_meta(self.embedding_dir / "item_meta.json")
-        """取出和向量矩阵行号一一对应的样本列表。"""
-        self.items = self.meta["items"]
-        """加载 MUGE 一文多图聚合映射（row_id -> doc_id）。"""
-        self.muge_mapping = load_muge_mapping(self.embedding_dir / "muge_mapping.json")
-        self.row_to_text_id = self.muge_mapping["row_to_text_id"]
-        """索引元信息在新格式下是强制契约；老 baseline 可缺失。"""
+        """加载文档级元信息；旧 pair-level 产物会给出迁移提示。"""
+        self.meta = self.load_meta(self.embedding_dir / "retrieval_meta.json")
+        self.documents = self.meta["documents"]
+        self.image_assets = self.meta["image_assets"]
+        self.doc_image_rows = build_doc_image_rows(len(self.documents), self.image_assets)
+        self.text_embeddings = np.load(self.embedding_dir / "text_embeddings.npy", mmap_mode="r")
+        self.image_embeddings = np.load(self.embedding_dir / "image_embeddings.npy", mmap_mode="r")
+        """索引元信息在 v2 中是强制契约。"""
         self.index_meta = load_json(self.embedding_dir / "index_meta.json", default=None)
         self.metadata_mode = self.detect_metadata_mode(self.meta, self.index_meta)
         """解析 HNSW 查询深度；显式参数优先于索引元数据。"""
@@ -123,7 +134,7 @@ class SearchPipeline:
         self.text_index = self.load_index(self.embedding_dir / "text.index", use_gpu_faiss)
         """加载图片向量索引；有显卡时优先尝试搬到显卡。"""
         self.image_index = self.load_index(self.embedding_dir / "image.index", use_gpu_faiss)
-        """模型、两个索引和 item_meta 全部加载后执行一次启动交叉校验。"""
+        """模型、两个索引和 retrieval_meta 全部加载后执行一次启动交叉校验。"""
         self.validate_startup_compatibility()
 
     @staticmethod
@@ -145,14 +156,20 @@ class SearchPipeline:
         """
         读取检索元信息文件。
 
-        这个文件保存 row_id 到原始文本、图片路径、数据来源等字段的映射。
+        这个文件保存文档、完整图片列表和图片到文档的多所有者映射。
         """
         """读取结构化元信息。"""
         meta = load_json(path)
         """元信息缺失时直接报错，因为 FAISS 只能返回行号，无法独立展示结果。"""
-        if not meta or "items" not in meta:
-            """抛出清晰错误，提示用户先完成向量抽取。"""
-            raise FileNotFoundError(f"缺少可用元信息文件：{path}")
+        if not meta:
+            legacy = path.with_name("item_meta.json")
+            if legacy.is_file():
+                raise ValueError(
+                    "检测到旧 pair-level item_meta.json；请运行 "
+                    "scripts/migrate_pair_artifacts.py 生成 schema v2 产物"
+                )
+            raise FileNotFoundError(f"缺少可用文档级元信息文件：{path}")
+        validate_retrieval_meta(meta)
         """返回元信息字典。"""
         return meta
 
@@ -206,28 +223,28 @@ class SearchPipeline:
 
     @staticmethod
     def detect_metadata_mode(item_meta: Mapping[str, Any], index_meta: Any) -> str:
-        """识别严格新格式或兼容老 baseline，并拒绝半升级状态。"""
+        """只接受完整的文档级 v2 元数据。"""
 
         if index_meta is not None and not isinstance(index_meta, Mapping):
             raise ValueError("index_meta.json 根节点必须是对象")
+        validate_retrieval_meta(item_meta)
+        if not isinstance(index_meta, Mapping) or int(index_meta.get("schema_version", 0)) != 2:
+            raise MetadataMismatchError(
+                "只支持文档级 index_meta schema_version=2；请重新构建 HNSW 索引"
+            )
         required = set(REQUIRED_COMPATIBILITY_FIELDS)
         item_fields = required.intersection(item_meta)
-        index_fields = required.intersection(index_meta or {})
-        if not item_fields and not index_fields:
-            warnings.warn(
-                "检测到老 baseline：缺少模型/数据兼容字段，将保持可用但无法验证产物身份",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return "legacy"
+        index_fields = required.intersection(index_meta)
         if item_fields != required or index_fields != required:
             missing_item = sorted(required - item_fields)
             missing_index = sorted(required - index_fields)
             raise MetadataMismatchError(
-                "新格式元数据不完整，禁止启动："
-                f"item_meta 缺少 {missing_item}；index_meta 缺少 {missing_index}"
+                "v2 元数据不完整，禁止启动："
+                f"retrieval_meta 缺少 {missing_item}；index_meta 缺少 {missing_index}"
             )
-        assert_metadata_compatible(index_meta, item_meta, context="索引与 item_meta")
+        assert_metadata_compatible(index_meta, item_meta, context="索引与 retrieval_meta")
+        if index_meta.get("retrieval_manifest_hash") != item_meta.get("retrieval_manifest_hash"):
+            raise MetadataMismatchError("索引与 retrieval_meta 的 retrieval_manifest_hash 不一致")
         return "strict"
 
     def model_dimension(self) -> int:
@@ -279,51 +296,48 @@ class SearchPipeline:
                 raise MetadataMismatchError(f"{name} HNSW efConstruction 与 index_meta 不一致")
 
     def validate_startup_compatibility(self) -> None:
-        """交叉校验最终模型、index_meta、item_meta 与真实索引。"""
+        """交叉校验最终模型、v2 元数据、向量矩阵和两个不同规模的索引。"""
 
-        expected_count = len(self.items)
-        if int(self.meta.get("count", expected_count)) != expected_count:
-            raise MetadataMismatchError("item_meta.count 与 items 列表长度不一致")
+        document_count = len(self.documents)
+        image_count = len(self.image_assets)
+        if int(self.meta.get("document_count", -1)) != document_count:
+            raise MetadataMismatchError("retrieval_meta.document_count 不一致")
+        if int(self.meta.get("image_count", -1)) != image_count:
+            raise MetadataMismatchError("retrieval_meta.image_count 不一致")
         model_dim = self.model_dimension()
-
-        if self.metadata_mode == "strict":
-            if self.index_meta.get("index_type") != "IndexHNSWFlat":
-                raise MetadataMismatchError("index_meta.index_type 必须为 IndexHNSWFlat")
-            if self.index_meta.get("metric") != "inner_product":
-                raise MetadataMismatchError("index_meta.metric 必须为 inner_product")
-            model_dir = Path(self.model_name)
-            if not model_dir.is_dir():
-                raise MetadataMismatchError("新格式索引必须使用可计算内容指纹的本地最终模型目录")
-            normalization = str(self.retrieval_config.get("normalization", "l2")).lower()
-            if normalization != "l2":
-                raise MetadataMismatchError(f"查询流水线只支持 l2 归一化，模型配置为 {normalization!r}")
-            configured_dim = self.retrieval_config.get("dimension")
-            if configured_dim is not None and int(configured_dim) != model_dim:
-                raise MetadataMismatchError("retrieval_config.dimension 与实际模型维度不一致")
-            expected = dict(self.meta)
-            expected.update(
-                {
-                    "model_fingerprint": compute_model_fingerprint(model_dir),
-                    "dimension": model_dim,
-                    "normalization": normalization,
-                }
-            )
-            assert_metadata_compatible(self.meta, expected, context="最终模型与 item_meta")
-            assert_metadata_compatible(self.index_meta, expected, context="最终模型与索引")
-            for label, payload in (("item_meta", self.meta), ("index_meta", self.index_meta)):
-                if payload.get("max_length") is not None and int(payload["max_length"]) != self.max_length:
-                    raise MetadataMismatchError(f"{label}.max_length 与最终模型 retrieval_config 不一致")
-            if int(self.index_meta.get("count", expected_count)) != expected_count:
-                raise MetadataMismatchError("index_meta.count 与 item_meta 不一致")
-        else:
-            """老 baseline 仍检查不会影响兼容性的基本维度，避免 FAISS 在查询时才崩溃。"""
-            expected_dim = int(getattr(self.text_index, "d", model_dim))
-            if model_dim != expected_dim:
-                raise MetadataMismatchError("老 baseline 的模型维度与索引维度不一致")
-
+        if self.index_meta.get("index_type") != "IndexHNSWFlat":
+            raise MetadataMismatchError("index_meta.index_type 必须为 IndexHNSWFlat")
+        if self.index_meta.get("metric") != "inner_product":
+            raise MetadataMismatchError("index_meta.metric 必须为 inner_product")
+        model_dir = Path(self.model_name)
+        if not model_dir.is_dir():
+            raise MetadataMismatchError("v2 索引必须使用可计算内容指纹的本地最终模型目录")
+        normalization = str(self.retrieval_config.get("normalization", "l2")).lower()
+        if normalization != "l2":
+            raise MetadataMismatchError(f"查询流水线只支持 l2 归一化，模型配置为 {normalization!r}")
+        configured_dim = self.retrieval_config.get("dimension")
+        if configured_dim is not None and int(configured_dim) != model_dim:
+            raise MetadataMismatchError("retrieval_config.dimension 与实际模型维度不一致")
+        expected = dict(self.meta)
+        expected.update(
+            {
+                "model_fingerprint": compute_model_fingerprint(model_dir),
+                "dimension": model_dim,
+                "normalization": normalization,
+            }
+        )
+        assert_metadata_compatible(self.meta, expected, context="最终模型与 retrieval_meta")
+        assert_metadata_compatible(self.index_meta, expected, context="最终模型与索引")
+        for label, payload in (("retrieval_meta", self.meta), ("index_meta", self.index_meta)):
+            if payload.get("max_length") is not None and int(payload["max_length"]) != self.max_length:
+                raise MetadataMismatchError(f"{label}.max_length 与最终模型 retrieval_config 不一致")
         expected_dim = int(self.meta.get("dimension", model_dim))
-        self._validate_one_index("text", self.text_index, expected_count, expected_dim)
-        self._validate_one_index("image", self.image_index, expected_count, expected_dim)
+        if tuple(self.text_embeddings.shape) != (document_count, expected_dim):
+            raise MetadataMismatchError("text_embeddings shape 与文档元数据不一致")
+        if tuple(self.image_embeddings.shape) != (image_count, expected_dim):
+            raise MetadataMismatchError("image_embeddings shape 与图片元数据不一致")
+        self._validate_one_index("text", self.text_index, document_count, expected_dim)
+        self._validate_one_index("image", self.image_index, image_count, expected_dim)
 
     def load_index(self, path: Path, use_gpu: bool):
         """
@@ -475,18 +489,7 @@ class SearchPipeline:
         """
         把 FAISS 返回的距离和行号整理成 row_id 到分数的字典。
         """
-        """准备分数字典。"""
-        scores: Dict[int, float] = {}
-        """遍历当前 query 的所有召回结果。"""
-        for score, row_id in zip(distances[0].tolist(), indices[0].tolist()):
-            """FAISS 用负行号表示无效结果，需要跳过。"""
-            if row_id < 0:
-                """跳过无效行号。"""
-                continue
-            """同一行如果重复出现，保留更高分数。"""
-            scores[int(row_id)] = max(float(score), scores.get(int(row_id), float("-inf")))
-        """返回整理后的分数。"""
-        return scores
+        return collect_faiss_scores(distances, indices)
 
     def search_index(self, index, query_embedding: np.ndarray, top_k: int) -> Dict[int, float]:
         """
@@ -525,45 +528,6 @@ class SearchPipeline:
         """空字符串按没有图片查询处理。"""
         return value or None
 
-    def fuse_route_scores(
-        self,
-        route_scores: Mapping[str, Mapping[int, float]],
-        has_text: bool,
-        has_image: bool,
-        alpha: float,
-    ) -> List[dict]:
-        """把四路候选按固定 late fusion 公式合并并排序。"""
-
-        candidates = sorted(set().union(*(scores.keys() for scores in route_scores.values())))
-        denominator = max(int(has_text) + int(has_image), 1)
-        results: List[dict] = []
-        for row_id in candidates:
-            if row_id < 0 or row_id >= len(self.items):
-                raise MetadataMismatchError(f"索引返回越界 row_id={row_id}，item_meta 与索引未对齐")
-            score_tt = route_scores["score_tt"].get(row_id, 0.0)
-            score_ti = route_scores["score_ti"].get(row_id, 0.0)
-            score_it = route_scores["score_it"].get(row_id, 0.0)
-            score_ii = route_scores["score_ii"].get(row_id, 0.0)
-            score_text_index = ((score_tt if has_text else 0.0) + (score_it if has_image else 0.0)) / denominator
-            score_image_index = ((score_ti if has_text else 0.0) + (score_ii if has_image else 0.0)) / denominator
-            score_mm = alpha * score_text_index + (1.0 - alpha) * score_image_index
-            item = dict(self.items[row_id])
-            item.update(
-                {
-                    "row_id": row_id,
-                    "score_tt": score_tt,
-                    "score_ti": score_ti,
-                    "score_it": score_it,
-                    "score_ii": score_ii,
-                    "score_text_index": score_text_index,
-                    "score_image_index": score_image_index,
-                    "score_mm": score_mm,
-                }
-            )
-            results.append(item)
-        results.sort(key=lambda row: row["score_mm"], reverse=True)
-        return results
-
     def search(
         self,
         query: Optional[str] = None,
@@ -589,39 +553,41 @@ class SearchPipeline:
             raise ValueError("top_k_recall 必须是正整数")
         if top_k_final <= 0:
             return []
-        """记录文本查询是否可用。"""
         has_text = query is not None
-        """记录图片查询是否可用。"""
         has_image = image_path is not None
         text_embedding = None
         image_embedding = None
-        """查询只编码一次；固定召回 top_k_recall 个图文对，不做自适应扩充。"""
         if has_text:
             text_embedding = self.encode_text(query)
         if has_image:
             image_embedding = self.encode_image(image_path)
 
-        recall_k = max(int(top_k_recall), int(top_k_final))
-        route_scores: Dict[str, Dict[int, float]] = {
-            "score_tt": {},
-            "score_ti": {},
-            "score_it": {},
-            "score_ii": {},
-        }
+        recall_k = min(len(self.documents), max(int(top_k_recall), int(top_k_final)))
+        candidate_docs: set[int] = set()
         if has_text:
-            route_scores["score_tt"] = self.search_index(self.text_index, text_embedding, recall_k)
-            route_scores["score_ti"] = self.search_index(self.image_index, text_embedding, recall_k)
+            candidate_docs.update(self.search_index(self.text_index, text_embedding, recall_k))
+            image_docs, _ = adaptive_image_candidates(
+                self.image_index, text_embedding, self.image_assets, recall_k
+            )
+            candidate_docs.update(image_docs)
         if has_image:
-            route_scores["score_it"] = self.search_index(self.text_index, image_embedding, recall_k)
-            route_scores["score_ii"] = self.search_index(self.image_index, image_embedding, recall_k)
-        """四路分数融合并按 score_mm 降序排列。"""
-        ranked = self.fuse_route_scores(route_scores, has_text, has_image, alpha)
-        """取前 top_k_recall 个图文对作为候选池。"""
-        candidates = ranked[:recall_k]
-        """MUGE 一文多图聚合（Flickr/COCO 保持独立），聚合后重新排序。"""
-        aggregated = aggregate_results(candidates, self.items, self.row_to_text_id)
-        """返回前 top_k_final 个文档级结果。"""
-        return aggregated[:top_k_final]
+            candidate_docs.update(self.search_index(self.text_index, image_embedding, recall_k))
+            image_docs, _ = adaptive_image_candidates(
+                self.image_index, image_embedding, self.image_assets, recall_k
+            )
+            candidate_docs.update(image_docs)
+        ranked = exact_score_documents(
+            candidate_docs,
+            text_query=text_embedding,
+            image_query=image_embedding,
+            text_embeddings=self.text_embeddings,
+            image_embeddings=self.image_embeddings,
+            documents=self.documents,
+            image_assets=self.image_assets,
+            doc_image_rows=self.doc_image_rows,
+            alpha=alpha,
+        )
+        return ranked[:top_k_final]
 
     @staticmethod
     def dumps(results: List[dict]) -> str:

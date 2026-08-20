@@ -24,7 +24,7 @@
 基座：OFA-Sys/chinese-clip-vit-base-patch16
 训练输出：outputs/finetune_lora
 当前正式模型：outputs/finetune_lora/exported_model
-当前正式全量索引：outputs/finetuned_full
+当前文档级全量索引：outputs/finetuned_docs_v2
 ```
 
 ## 4. 开始微调
@@ -127,10 +127,12 @@ bash scripts/run_rebuild_finetuned.sh
 tail -f outputs/finetune_lora/rebuild.log
 ```
 
-新向量和索引只写入 `outputs/finetuned_full`。任务结束后查看：
+新向量和索引只写入 `outputs/finetuned_docs_v2`。旧 pair-level 目录
+`outputs/finetuned_full` 不会被覆盖。任务结束后查看：
 
 ```bash
 cat outputs/finetune_lora/rebuild_exit_code
 ```
 
-输出为 `0` 表示向量抽取和两个 FAISS 索引均成功。当前正式检索入口默认加载 `outputs/finetune_lora/exported_model` 和 `outputs/finetuned_full`；原始基线索引已删除，如需回退必须使用保留的基座缓存重新抽取向量并构建索引。
+输出为 `0` 表示文档文本向量、唯一图片向量和两份 FAISS 索引均成功。当前检索入口默认加载
+`outputs/finetune_lora/exported_model` 和 `outputs/finetuned_docs_v2`。文本索引一行对应一篇笔记，图片索引一行对应一张全局唯一图片，两者行数不要求相同。

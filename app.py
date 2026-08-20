@@ -52,33 +52,20 @@ PIPELINE = SearchPipeline(
 )
 
 
-def resolve_result_image(row: dict) -> str | None:
-    """
-    把结果里的代表图片路径转成 Gradio 可展示的真实路径。
-    """
-    """读取结果代表图片路径（MUGE 聚合文档取最高分匹配的图）。"""
-    image_path = row.get("best_image_path")
-    """图片路径缺失时返回空。"""
+def resolve_image_path(image_path: str | None) -> str | None:
+    """Resolve one image from a document's complete image list."""
+
     if not image_path:
-        """表示当前结果没有图片。"""
         return None
-    """把路径对象化。"""
     path = Path(image_path)
-    """相对路径按项目根目录解析。"""
     if not path.is_absolute():
-        """拼出项目内真实图片路径。"""
         path = PROJECT_ROOT / path
-    """如果文件存在，就返回字符串路径。"""
-    if path.exists():
-        """返回 Gradio 可读取路径。"""
-        return str(path)
-    """文件不存在时返回空，避免页面报错。"""
-    return None
+    return str(path) if path.exists() else None
 
 
 def rows_to_table(results: list[dict]) -> pd.DataFrame:
     """
-    把搜索结果转成表格（文档级，MUGE 多图聚合）。
+    把文档级搜索结果转成表格。
     """
     """准备表格行。"""
     rows = []
@@ -94,10 +81,9 @@ def rows_to_table(results: list[dict]) -> pd.DataFrame:
                 "图片索引分": round(float(row.get("score_image_index", 0.0)), 4),
                 "文搜文": round(float(row.get("score_tt", 0.0)), 4),
                 "文搜图": round(float(row.get("score_ti", 0.0)), 4),
-                "类型": "聚合" if row.get("type") == "aggregated" else "独立",
-                "图片数": row.get("item_count", 1),
+                "图片数": row.get("image_count", len(row.get("image_paths", []))),
                 "文本": row.get("text"),
-                "代表图": row.get("best_image_path"),
+                "最佳匹配图": row.get("matched_image_path"),
                 "来源": row.get("source"),
                 "划分": row.get("split"),
                 "编号": row.get("doc_id"),
@@ -126,16 +112,19 @@ def search(query: str, image_path: str | None):
         return [], pd.DataFrame([{"错误": str(exc)}])
     """准备图片展示数据。"""
     gallery = []
-    """逐条生成图片和标题。"""
+    """按笔记排名连续展示每篇笔记的完整图片集合。"""
     for rank, row in enumerate(results, start=1):
-        """解析结果代表图片路径。"""
-        image = resolve_result_image(row)
-        """图片存在时加入展示列表。"""
-        if image:
-            """标题包含排名、分数、图片数和短文本。"""
-            item_count = row.get("item_count", 1)
-            count_label = f"({item_count}图)" if item_count > 1 else ""
-            gallery.append((image, f"{rank}. {row.get('score_mm', 0.0):.4f}{count_label} {row.get('text')}"))
+        image_paths = list(row.get("image_paths") or [])
+        for image_number, image_path in enumerate(image_paths, start=1):
+            image = resolve_image_path(image_path)
+            if image:
+                gallery.append(
+                    (
+                        image,
+                        f"笔记 {rank} · 图 {image_number}/{len(image_paths)} · "
+                        f"{row.get('score_mm', 0.0):.4f} · {row.get('text')}",
+                    )
+                )
     """返回图片墙和表格。"""
     return gallery, rows_to_table(results)
 
@@ -153,7 +142,7 @@ with gr.Blocks(title="项目一中文图文搜索") as demo:
     """搜索按钮。"""
     search_button = gr.Button("搜索", variant="primary")
     """图片结果区域。"""
-    gallery_output = gr.Gallery(label="Top10 图片结果", columns=5, height=420)
+    gallery_output = gr.Gallery(label="Top10 笔记的完整图片", columns=5, height=520)
     """表格结果区域。"""
     table_output = gr.Dataframe(label="Top10 结果明细", wrap=True)
     """绑定点击事件。"""

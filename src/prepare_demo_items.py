@@ -21,6 +21,11 @@ from pathlib import Path
 """引入图片读取库，用于检查解码后的图片文件是否能正常打开。"""
 from PIL import Image
 
+try:
+    from document_schema import build_documents_from_pairs, read_jsonl, write_documents_jsonl
+except ImportError:
+    from src.document_schema import build_documents_from_pairs, read_jsonl, write_documents_jsonl
+
 
 """定义需要处理的数据集，以及每个数据集要处理哪些划分。"""
 SOURCE_SPLITS = {
@@ -498,6 +503,11 @@ def main():
         """抛出图片校验失败错误，并展示前几个失败样例。"""
         raise RuntimeError(f"图片抽样校验失败，样例={pil_failures[:5]}")
 
+    """把 pair 清单规范化为真正的文档级输入，一文多图只写一行。"""
+    documents, image_assets, _, _ = build_documents_from_pairs(read_jsonl(items_path))
+    documents_path = processed_root / "documents.jsonl"
+    write_documents_jsonl(documents, documents_path)
+
     """写入第一版人工查询集，并记录输出路径。"""
     manual_queries_path = write_manual_queries(project_root, args.output_name)
     """写入人工评估模板，并记录输出路径。"""
@@ -508,6 +518,9 @@ def main():
     summary = {
         "output_name": args.output_name,
         "items_path": str(items_path),
+        "documents_path": str(documents_path),
+        "document_count": len(documents),
+        "unique_image_asset_count": len(image_assets),
         "manual_queries_path": str(manual_queries_path),
         "eval_template_path": str(eval_template_path),
         "total_items_written": total_items_written,
