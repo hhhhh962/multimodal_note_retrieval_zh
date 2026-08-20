@@ -50,6 +50,30 @@ class HnswBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不是 l2 归一化向量"):
             add_embeddings(index, values, chunk_size=2, desc="bad")
 
+    def test_low_memory_builder_outputs_float32_hnsw_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vectors = normalized([[1, 0], [0, 1], [1, 1], [-1, 0]])
+            np.save(root / "vectors.npy", vectors)
+            info = build_one(
+                root / "vectors.npy",
+                root / "vectors.index",
+                2,
+                8,
+                40,
+                4,
+                2,
+                low_memory_build=True,
+            )
+            index = faiss.read_index(str(root / "vectors.index"))
+            scores, ids = index.search(vectors, 1)
+            self.assertIsInstance(index, faiss.IndexHNSWFlat)
+            self.assertIsInstance(faiss.downcast_index(index.storage), faiss.IndexFlat)
+            self.assertEqual(ids[:, 0].tolist(), [0, 1, 2, 3])
+            self.assertTrue(np.allclose(scores[:, 0], 1.0, atol=1e-5))
+            self.assertEqual(info["graph_build_storage"], "sq_fp16")
+            self.assertEqual(info["final_storage"], "flat_float32")
+
     def test_rejects_invalid_parameters(self) -> None:
         args = argparse.Namespace(
             chunk_size=1,

@@ -156,6 +156,8 @@ python src/build_faiss_index.py \
 
 构建器会校验 schema、数量、维度、L2 归一化、模型指纹和数据清单哈希，然后写出 `text.index`、`image.index` 和 `index_meta.json`。
 
+内存只有约 2GB 时可增加 `--low_memory_build --faiss_threads 1 --chunk_size 5000`。该模式仅在建图阶段用 FP16 scalar-quantized 存储降低峰值，随后把邻接图装配回完整 float32 `IndexHNSWFlat`；`index_meta.json` 会同时记录建图存储与最终存储。应通过下文 benchmark 验证近似召回保持率。
+
 ### 4. 检索
 
 文本查询：

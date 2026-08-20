@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("FAISS_NUM_THREADS", "1")),
         help="FAISS/OpenMP 构建线程数；小内存机器默认 1",
     )
+    parser.add_argument(
+        "--low_memory_build",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="用 FP16 SQ 仅构建 HNSW 图，再装配标准 float32 IndexHNSWFlat",
+    )
     parser.add_argument("--replace_existing", action="store_true")
     # Retained for CLI compatibility; benchmarking is now an explicit separate step.
     parser.add_argument("--benchmark_sample_size", type=int, default=DEFAULT_SAMPLE_SIZE)
@@ -112,6 +118,7 @@ def build_one(
     expected_count: int | None = None,
     expected_dimension: int | None = None,
     normalization: str = "l2",
+    low_memory_build: bool = False,
 ) -> dict[str, Any]:
     embeddings = np.load(embedding_path, mmap_mode="r")
     if embeddings.ndim != 2:
@@ -123,13 +130,23 @@ def build_one(
         raise ValueError(f"{embedding_path.name} dimension={dimension}，期望 {expected_dimension}")
     if str(normalization).lower() != "l2":
         raise ValueError("HNSW 内积索引只支持 l2 归一化向量")
-    index = faiss.IndexHNSWFlat(dimension, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
+    if low_memory_build:
+        index = faiss.IndexHNSWSQ(
+            dimension,
+            faiss.ScalarQuantizer.QT_fp16,
+            int(hnsw_m),
+            faiss.METRIC_INNER_PRODUCT,
+        )
+    else:
+        index = faiss.IndexHNSWFlat(dimension, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = int(ef_construction)
     index.hnsw.efSearch = FIXED_EF_SEARCH
     started = time.perf_counter()
     add_embeddings(index, embeddings, int(chunk_size), embedding_path.stem)
     if int(index.ntotal) != count:
         raise RuntimeError("HNSW ntotal 与 embedding 数量不一致")
+    if low_memory_build:
+        index = assemble_flat_hnsw(index, embeddings, dimension, hnsw_m, count)
     faiss.write_index(index, str(index_path))
     del index
     gc.collect()
@@ -146,7 +163,57 @@ def build_one(
         "normalization": "l2",
         "size_bytes": int(index_path.stat().st_size),
         "build_seconds": time.perf_counter() - started,
+        "graph_build_storage": "sq_fp16" if low_memory_build else "flat_float32",
+        "final_storage": "flat_float32",
     }
+
+
+def assemble_flat_hnsw(
+    graph_index: faiss.Index,
+    embeddings: np.ndarray,
+    dimension: int,
+    hnsw_m: int,
+    count: int,
+) -> faiss.Index:
+    """Move an SQ-built graph into a serializable float32 IndexHNSWFlat."""
+
+    vector_fields = (
+        "levels",
+        "offsets",
+        "neighbors",
+        "cum_nneighbor_per_level",
+        "assign_probas",
+    )
+    scalar_fields = (
+        "entry_point",
+        "max_level",
+        "efConstruction",
+        "efSearch",
+        "check_relative_distance",
+        "search_bounded_queue",
+    )
+    graph_vectors = {
+        name: faiss.vector_to_array(getattr(graph_index.hnsw, name)) for name in vector_fields
+    }
+    graph_scalars = {name: getattr(graph_index.hnsw, name) for name in scalar_fields}
+    del graph_index
+    gc.collect()
+
+    final = faiss.IndexHNSWFlat(dimension, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
+    storage = faiss.downcast_index(final.storage)
+    for start in range(0, count, 5000):
+        end = min(start + 5000, count)
+        storage.add(np.ascontiguousarray(embeddings[start:end], dtype="float32"))
+    if int(storage.ntotal) != count:
+        raise RuntimeError("装配后的 IndexFlat 存储数量不一致")
+    final.ntotal = count
+    for name, values in graph_vectors.items():
+        faiss.copy_array_to_vector(values, getattr(final.hnsw, name))
+    for name, value in graph_scalars.items():
+        setattr(final.hnsw, name, value)
+    if int(final.hnsw.offsets.size()) != count + 1:
+        raise RuntimeError("装配后的 HNSW offsets 数量不一致")
+    return final
 
 
 def main() -> int:
@@ -190,6 +257,7 @@ def main() -> int:
             expected_count=document_count,
             expected_dimension=dimension,
             normalization=meta["normalization"],
+            low_memory_build=args.low_memory_build,
         )
         image_info = build_one(
             embedding_dir / "image_embeddings.npy",
@@ -200,6 +268,7 @@ def main() -> int:
             expected_count=image_count,
             expected_dimension=dimension,
             normalization=meta["normalization"],
+            low_memory_build=args.low_memory_build,
         )
     except Exception:
         for path in temporary.values():

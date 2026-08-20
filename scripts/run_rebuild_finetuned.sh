@@ -73,6 +73,7 @@ nohup bash -c '
       --output_dir "$output_dir" \
       --chunk_size 5000 \
       --faiss_threads 1 \
+      --low_memory_build \
       --hnsw_m 32 \
       --ef_construction 200 \
       --replace_existing

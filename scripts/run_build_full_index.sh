@@ -18,6 +18,7 @@ nohup "$PYTHON" -u src/build_faiss_index.py \
   --embedding_dir "$OUTPUT_DIR" \
   --chunk_size 5000 \
   --faiss_threads 1 \
+  --low_memory_build \
   --hnsw_m 32 \
   --ef_construction 200 \
   --replace_existing \
