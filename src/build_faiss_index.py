@@ -192,10 +192,13 @@ def assemble_flat_hnsw(
         "check_relative_distance",
         "search_bounded_queue",
     )
+    graph_scalars = {name: getattr(graph_index.hnsw, name) for name in scalar_fields}
+    graph_storage = faiss.downcast_index(graph_index.storage)
+    graph_storage.reset()
+    gc.collect()
     graph_vectors = {
         name: faiss.vector_to_array(getattr(graph_index.hnsw, name)) for name in vector_fields
     }
-    graph_scalars = {name: getattr(graph_index.hnsw, name) for name in scalar_fields}
     del graph_index
     gc.collect()
 
@@ -207,8 +210,11 @@ def assemble_flat_hnsw(
     if int(storage.ntotal) != count:
         raise RuntimeError("装配后的 IndexFlat 存储数量不一致")
     final.ntotal = count
-    for name, values in graph_vectors.items():
+    for name in list(graph_vectors):
+        values = graph_vectors.pop(name)
         faiss.copy_array_to_vector(values, getattr(final.hnsw, name))
+        del values
+        gc.collect()
     for name, value in graph_scalars.items():
         setattr(final.hnsw, name, value)
     if int(final.hnsw.offsets.size()) != count + 1:
