@@ -272,6 +272,30 @@ class DocumentRetrievalTests(unittest.TestCase):
         self.assertAlmostEqual(result["overall"]["recall_at_5"], 2 / 3)
         self.assertAlmostEqual(result["overall"]["recall_at_10"], 2 / 3)
 
+    def test_pipeline_searches_complete_unique_documents_in_all_query_modes(self) -> None:
+        pipeline = SearchPipeline.__new__(SearchPipeline)
+        pipeline.documents = self.documents
+        pipeline.image_assets = self.image_assets
+        pipeline.doc_image_rows = self.doc_images
+        pipeline.text_embeddings = self.text
+        pipeline.image_embeddings = self.images
+        pipeline.text_index = faiss.IndexFlatIP(2)
+        pipeline.text_index.add(self.text)
+        pipeline.image_index = faiss.IndexFlatIP(2)
+        pipeline.image_index.add(self.images)
+        pipeline.encode_text = lambda _: np.asarray([[1, 0]], dtype="float32")
+        pipeline.encode_image = lambda _: np.asarray([[1, 0]], dtype="float32")
+
+        for kwargs in (
+            {"query": "blue"},
+            {"image_path": "query.jpg"},
+            {"query": "blue", "image_path": "query.jpg"},
+        ):
+            results = pipeline.search(**kwargs, top_k_recall=2, top_k_final=2)
+            self.assertEqual(len({row["doc_id"] for row in results}), len(results))
+            self.assertEqual(results[0]["doc_id"], "d0")
+            self.assertEqual(results[0]["image_paths"], ["red.jpg", "blue.jpg"])
+
 
 class PipelineIndexLoadingTests(unittest.TestCase):
     def test_load_hnsw_stays_on_cpu_and_applies_ef_search(self) -> None:
