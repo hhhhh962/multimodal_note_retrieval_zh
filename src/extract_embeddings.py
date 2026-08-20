@@ -21,6 +21,7 @@ try:
         build_retrieval_meta,
         normalize_documents,
         read_jsonl,
+        validate_retrieval_meta,
     )
     from model_fingerprint import (
         MetadataMismatchError,
@@ -29,12 +30,14 @@ try:
         compute_data_manifest_hash,
         compute_model_fingerprint,
     )
+    from retrieval_storage import write_external_metadata
 except ImportError:
     from src.document_schema import (
         SCHEMA_VERSION,
         build_retrieval_meta,
         normalize_documents,
         read_jsonl,
+        validate_retrieval_meta,
     )
     from src.model_fingerprint import (
         MetadataMismatchError,
@@ -43,6 +46,7 @@ except ImportError:
         compute_data_manifest_hash,
         compute_model_fingerprint,
     )
+    from src.retrieval_storage import write_external_metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -261,9 +265,18 @@ def main() -> int:
         normalization="l2",
         max_length=args.max_length,
     )
-    meta = build_retrieval_meta(
+    inline_meta = build_retrieval_meta(
         documents, image_assets, compatibility, source_items_path=str(args.documents)
     )
+    existing_meta = load_json(output_dir / "retrieval_meta.json")
+    if existing_meta is None:
+        meta = write_external_metadata(inline_meta, documents, image_assets, output_dir)
+        validate_retrieval_meta(meta, output_dir)
+    else:
+        meta = existing_meta
+        validate_retrieval_meta(meta, output_dir)
+        if meta.get("retrieval_manifest_hash") != inline_meta["retrieval_manifest_hash"]:
+            raise MetadataMismatchError("documents.jsonl 与已有 retrieval_meta 不一致")
     state = prepare_state(output_dir, meta, compatibility, args.resume)
     text_array = open_array(
         output_dir / "text_embeddings.npy", (len(documents), dimension), args.resume

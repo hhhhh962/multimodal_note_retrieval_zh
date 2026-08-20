@@ -143,7 +143,7 @@ python src/extract_embeddings.py \
   --resume
 ```
 
-输出中，`text_embeddings.npy` 的行数等于笔记数，`image_embeddings.npy` 的行数等于唯一图片数。
+输出中，`text_embeddings.npy` 的行数等于笔记数，`image_embeddings.npy` 的行数等于唯一图片数。为避免全量数据在小内存机器上加载成数十万个 Python 对象，`retrieval_meta.json` 只保存 schema、计数、指纹、哈希和文件引用；完整文档与图片资产保存在带随机访问偏移表的 JSONL 中，双向图文关系保存在 CSR NumPy 数组中。检索时只解析召回到的候选笔记。
 
 ### 3. 构建两份 HNSW 索引
 
@@ -240,6 +240,7 @@ python -m unittest discover -s tests -v
 app.py                              Gradio 页面
 src/document_schema.py              文档与图片关系 schema
 src/document_retrieval.py           候选展开和文档级精确重算
+src/retrieval_storage.py             磁盘式 JSONL 偏移表与图文 CSR 关系
 src/prepare_demo_items.py            生成 documents.jsonl
 src/extract_embeddings.py            抽取文档文本和唯一图片向量
 scripts/migrate_pair_artifacts.py     复用旧 pair 向量迁移到 v2

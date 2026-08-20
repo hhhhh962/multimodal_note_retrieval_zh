@@ -73,7 +73,7 @@ def load_extraction_metadata(embedding_dir: Path) -> tuple[dict[str, Any], dict[
                 "检测到旧 pair-level 产物；请先运行 scripts/migrate_pair_artifacts.py"
             )
         raise FileNotFoundError("缺少 extract_state.json 或 retrieval_meta.json")
-    validate_retrieval_meta(meta)
+    validate_retrieval_meta(meta, embedding_dir)
     if int(state.get("schema_version", 0)) != SCHEMA_VERSION or not state.get("complete"):
         raise ValueError("extract_state 不是完整的 schema v2 状态")
     assert_metadata_compatible(meta, state, context="抽取状态与 retrieval_meta")

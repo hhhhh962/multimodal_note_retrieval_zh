@@ -16,6 +16,7 @@ from src.document_schema import (
     normalize_documents,
     validate_retrieval_meta,
 )
+from src.retrieval_storage import load_external_metadata
 
 
 def normalized(values: list[list[float]]) -> np.ndarray:
@@ -109,11 +110,16 @@ class PairMigrationTests(unittest.TestCase):
             self.assertEqual(report["image_count"], 3)
             self.assertEqual(report["relation_count"], 4)
             meta = json.loads((output / "retrieval_meta.json").read_text(encoding="utf-8"))
-            validate_retrieval_meta(meta)
+            validate_retrieval_meta(meta, output)
             self.assertEqual(meta["schema_version"], 2)
-            self.assertEqual(meta["documents"][0]["doc_id"], "MUGE:train:t1")
-            self.assertEqual(len(meta["documents"][0]["images"]), 2)
-            self.assertEqual(meta["image_assets"][1]["doc_row_ids"], [0, 1])
+            self.assertEqual(meta["metadata_storage"], "jsonl_offsets_csr_v1")
+            documents, images, doc_images = load_external_metadata(meta, output)
+            self.assertEqual(documents[0]["doc_id"], "MUGE:train:t1")
+            self.assertEqual(len(documents[0]["images"]), 2)
+            self.assertEqual(images[1]["doc_row_ids"], [0, 1])
+            self.assertEqual(doc_images[0].tolist(), [0, 1])
+            documents.close()
+            images.close()
             self.assertEqual(np.load(output / "text_embeddings.npy").shape, (3, 3))
             self.assertEqual(np.load(output / "image_embeddings.npy").shape, (3, 3))
 

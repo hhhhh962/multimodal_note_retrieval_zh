@@ -45,6 +45,7 @@ try:
         collect_faiss_scores,
         exact_score_documents,
     )
+    from retrieval_storage import load_external_metadata
 except ImportError:
     """app.py 从项目根目录导入 src.search_pipeline 时使用这个导入路径。"""
     from src.model_fingerprint import (
@@ -61,6 +62,7 @@ except ImportError:
         collect_faiss_scores,
         exact_score_documents,
     )
+    from src.retrieval_storage import load_external_metadata
 
 
 """记录当前正式部署使用的微调模型和全量索引默认路径。"""
@@ -115,9 +117,14 @@ class SearchPipeline:
         self.gpu_resources = []
         """加载文档级元信息；旧 pair-level 产物会给出迁移提示。"""
         self.meta = self.load_meta(self.embedding_dir / "retrieval_meta.json")
-        self.documents = self.meta["documents"]
-        self.image_assets = self.meta["image_assets"]
-        self.doc_image_rows = build_doc_image_rows(len(self.documents), self.image_assets)
+        if self.meta.get("metadata_storage") == "jsonl_offsets_csr_v1":
+            self.documents, self.image_assets, self.doc_image_rows = load_external_metadata(
+                self.meta, self.embedding_dir
+            )
+        else:
+            self.documents = self.meta["documents"]
+            self.image_assets = self.meta["image_assets"]
+            self.doc_image_rows = build_doc_image_rows(len(self.documents), self.image_assets)
         self.text_embeddings = np.load(self.embedding_dir / "text_embeddings.npy", mmap_mode="r")
         self.image_embeddings = np.load(self.embedding_dir / "image_embeddings.npy", mmap_mode="r")
         """索引元信息在 v2 中是强制契约。"""
@@ -169,7 +176,7 @@ class SearchPipeline:
                     "scripts/migrate_pair_artifacts.py 生成 schema v2 产物"
                 )
             raise FileNotFoundError(f"缺少可用文档级元信息文件：{path}")
-        validate_retrieval_meta(meta)
+        validate_retrieval_meta(meta, path.parent)
         """返回元信息字典。"""
         return meta
 

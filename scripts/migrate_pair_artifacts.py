@@ -23,9 +23,9 @@ from src.document_schema import (  # noqa: E402
     build_documents_from_pairs,
     build_retrieval_meta,
     validate_retrieval_meta,
-    write_documents_jsonl,
 )
 from src.model_fingerprint import REQUIRED_COMPATIBILITY_FIELDS  # noqa: E402
+from src.retrieval_storage import write_external_metadata  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -223,15 +223,16 @@ def migrate(
         target_text = None
         target_image = None
 
-        write_json(temporary / "retrieval_meta.json", meta)
-        write_documents_jsonl(documents, temporary / "documents.jsonl")
+        compact_meta = write_external_metadata(meta, documents, image_assets, temporary)
+        validate_retrieval_meta(compact_meta, temporary)
+        write_json(temporary / "retrieval_meta.json", compact_meta)
         extraction_state = {
             **compatibility,
             "schema_version": SCHEMA_VERSION,
             "document_count": len(documents),
             "image_count": len(image_assets),
             "relation_count": meta["relation_count"],
-            "retrieval_manifest_hash": meta["retrieval_manifest_hash"],
+            "retrieval_manifest_hash": compact_meta["retrieval_manifest_hash"],
             "text_documents_done": len(documents),
             "image_assets_done": len(image_assets),
             "complete": True,

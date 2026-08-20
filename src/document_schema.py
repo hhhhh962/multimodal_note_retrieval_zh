@@ -248,7 +248,9 @@ def build_retrieval_meta(
     }
 
 
-def validate_retrieval_meta(meta: Mapping[str, Any]) -> None:
+def validate_retrieval_meta(
+    meta: Mapping[str, Any], artifact_dir: str | Path | None = None
+) -> None:
     """Fail fast on pair-level or internally inconsistent metadata."""
 
     if int(meta.get("schema_version", 0)) != SCHEMA_VERSION:
@@ -258,8 +260,23 @@ def validate_retrieval_meta(meta: Mapping[str, Any]) -> None:
         )
     documents = meta.get("documents")
     image_assets = meta.get("image_assets")
+    if isinstance(documents, Mapping) and isinstance(image_assets, Mapping):
+        if meta.get("metadata_storage") != "jsonl_offsets_csr_v1":
+            raise ValueError("外置元数据缺少 metadata_storage=jsonl_offsets_csr_v1")
+        if int(documents.get("count", -1)) != int(meta.get("document_count", -2)):
+            raise ValueError("documents.count 与 document_count 不一致")
+        if int(image_assets.get("count", -1)) != int(meta.get("image_count", -2)):
+            raise ValueError("image_assets.count 与 image_count 不一致")
+        relations = meta.get("relations")
+        if not isinstance(relations, Mapping) or int(relations.get("count", -1)) != int(
+            meta.get("relation_count", -2)
+        ):
+            raise ValueError("relations.count 与 relation_count 不一致")
+        if artifact_dir is not None:
+            _validate_external_artifacts(meta, Path(artifact_dir))
+        return
     if not isinstance(documents, list) or not isinstance(image_assets, list):
-        raise ValueError("retrieval_meta 缺少 documents 或 image_assets 列表")
+        raise ValueError("retrieval_meta 缺少 documents 或 image_assets")
     if int(meta.get("document_count", -1)) != len(documents):
         raise ValueError("retrieval_meta.document_count 与 documents 数量不一致")
     if int(meta.get("image_count", -1)) != len(image_assets):
@@ -295,6 +312,72 @@ def validate_retrieval_meta(meta: Mapping[str, Any]) -> None:
         raise ValueError("retrieval_meta.relation_count 与图片关系数量不一致")
     if meta.get("retrieval_manifest_hash") != retrieval_manifest_hash(documents, image_assets):
         raise ValueError("retrieval_meta.retrieval_manifest_hash 与实际内容不一致")
+
+
+def _validate_external_artifacts(meta: Mapping[str, Any], root: Path) -> None:
+    """Validate disk-backed JSONL/offset/CSR metadata without loading all records."""
+
+    import numpy as np
+
+    try:
+        from retrieval_storage import JsonlOffsetStore, CsrRows, sha256_file
+    except ImportError:
+        from src.retrieval_storage import JsonlOffsetStore, CsrRows, sha256_file
+
+    documents = meta["documents"]
+    images = meta["image_assets"]
+    relations = meta["relations"]
+    checksums = meta.get("metadata_artifact_sha256")
+    if not isinstance(checksums, Mapping) or not checksums:
+        raise ValueError("metadata_artifact_sha256 缺失")
+    for name, expected in checksums.items():
+        path = root / str(name)
+        if not path.is_file():
+            raise FileNotFoundError(f"元数据产物缺失：{path}")
+        if sha256_file(path) != expected:
+            raise ValueError(f"元数据产物 SHA256 不一致：{path.name}")
+
+    document_store = JsonlOffsetStore(
+        root / documents["file"],
+        root / documents["offsets_file"],
+        int(documents["count"]),
+    )
+    image_store = JsonlOffsetStore(
+        root / images["file"],
+        root / images["offsets_file"],
+        int(images["count"]),
+    )
+    try:
+        if len(document_store) != int(meta["document_count"]):
+            raise ValueError("documents JSONL 数量不一致")
+        if len(image_store) != int(meta["image_count"]):
+            raise ValueError("image_assets JSONL 数量不一致")
+    finally:
+        document_store.close()
+        image_store.close()
+
+    doc_image = CsrRows(
+        root / relations["doc_image_offsets_file"],
+        root / relations["doc_image_rows_file"],
+        int(meta["document_count"]),
+    )
+    image_doc = CsrRows(
+        root / relations["image_doc_offsets_file"],
+        root / relations["image_doc_rows_file"],
+        int(meta["image_count"]),
+    )
+    if len(doc_image.rows) != int(meta["relation_count"]) or len(image_doc.rows) != int(
+        meta["relation_count"]
+    ):
+        raise ValueError("CSR relation_count 不一致")
+    if len(doc_image.rows) and int(np.max(doc_image.rows)) >= int(meta["image_count"]):
+        raise ValueError("doc_image_rows 包含越界图片行")
+    if len(image_doc.rows) and int(np.max(image_doc.rows)) >= int(meta["document_count"]):
+        raise ValueError("image_doc_rows 包含越界文档行")
+    if np.any(np.diff(doc_image.offsets) == 0):
+        raise ValueError("存在没有图片的文档")
+    if np.any(np.diff(image_doc.offsets) == 0):
+        raise ValueError("存在没有所属文档的图片")
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:

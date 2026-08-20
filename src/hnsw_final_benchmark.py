@@ -13,9 +13,11 @@ import numpy as np
 try:
     from document_schema import validate_retrieval_meta
     from document_retrieval import adaptive_image_candidates, build_doc_image_rows, exact_score_documents
+    from retrieval_storage import external_relation_arrays, load_external_metadata
 except ImportError:
     from src.document_schema import validate_retrieval_meta
     from src.document_retrieval import adaptive_image_candidates, build_doc_image_rows, exact_score_documents
+    from src.retrieval_storage import external_relation_arrays, load_external_metadata
 
 
 FIXED_EF_SEARCH = 512
@@ -120,17 +122,21 @@ def benchmark_document_recall(
     candidate_pool_size: int,
 ) -> dict[str, Any]:
     meta = json.loads((embedding_dir / "retrieval_meta.json").read_text(encoding="utf-8"))
-    validate_retrieval_meta(meta)
-    documents = meta["documents"]
-    image_assets = meta["image_assets"]
+    validate_retrieval_meta(meta, embedding_dir)
+    if meta.get("metadata_storage") == "jsonl_offsets_csr_v1":
+        documents, image_assets, doc_image_rows = load_external_metadata(meta, embedding_dir)
+        rel_images, rel_docs = external_relation_arrays(meta, embedding_dir)
+    else:
+        documents = meta["documents"]
+        image_assets = meta["image_assets"]
+        doc_image_rows = build_doc_image_rows(len(documents), image_assets)
+        rel_images, rel_docs = relation_arrays(image_assets)
     text_embeddings = np.load(embedding_dir / "text_embeddings.npy", mmap_mode="r")
     image_embeddings = np.load(embedding_dir / "image_embeddings.npy", mmap_mode="r")
     text_index = faiss.read_index(str(index_dir / "text.index"))
     image_index = faiss.read_index(str(index_dir / "image.index"))
     text_index.hnsw.efSearch = FIXED_EF_SEARCH
     image_index.hnsw.efSearch = FIXED_EF_SEARCH
-    doc_image_rows = build_doc_image_rows(len(documents), image_assets)
-    rel_images, rel_docs = relation_arrays(image_assets)
     if sample_size <= 0 or candidate_pool_size < max(FINAL_KS):
         raise ValueError("sample_size 必须为正，candidate_pool_size 不能小于 10")
     rng = np.random.default_rng(20260820)
