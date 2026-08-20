@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.pid
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.log
+*.npy
+*.npz
+*.index
+*.faiss
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# 原始数据、向量、索引、模型、日志与人工评估产物不进入源码仓库。
+data/
+outputs/
+logs/
+reports/
+references/

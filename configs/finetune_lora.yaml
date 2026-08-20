@@ -1,0 +1,72 @@
+# Chinese-CLIP ViT-B/16 双塔 LoRA 微调配置。
+# 相对路径均从仓库根目录启动；也可复制本文件后按本机目录修改。
+model:
+  base_model: OFA-Sys/chinese-clip-vit-base-patch16
+  use_sdpa: true
+  gradient_checkpointing: true
+  verify_expected_trainable: true
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+
+data:
+  train_sources:
+    - source: MUGE
+        lmdb_path: data/MUGE/lmdb/train
+    - source: Flickr30k-CN
+        lmdb_path: data/Flickr30k-CN/lmdb/train
+    - source: COCO-CN
+        lmdb_path: data/COCO-CN/lmdb/train
+  datasets:
+    MUGE:
+      source: MUGE
+        root: data/MUGE
+      image_to_text: false
+    Flickr30k-CN:
+      source: Flickr30k-CN
+        root: data/Flickr30k-CN
+      image_to_text: true
+    COCO-CN:
+      source: COCO-CN
+        root: data/COCO-CN
+      image_to_text: true
+  epoch_size: 419294
+  temperature_exponent: 0.5
+  num_workers: 8
+  max_length: 52
+  image_size: 224
+  train_crop_scale: [0.8, 1.0]
+  hflip_probability: 0.5
+
+training:
+  output_dir: outputs/finetune_lora
+  device: auto
+  seed: 20260731
+  epochs: 2
+  micro_batch_size: auto
+  micro_batch_candidates: [64, 32, 16]
+  memory_fraction: 0.90
+  effective_batch_size: 256
+  precision: auto
+  gradient_clip: 1.0
+  eval_every_steps: 250
+  early_stopping_patience: 4
+
+optimizer:
+  lora_lr: 1.0e-4
+  projection_lr: 5.0e-5
+  logit_scale_lr: 1.0e-5
+  projection_weight_decay: 1.0e-3
+  warmup_ratio: 0.05
+
+evaluation:
+  precision: auto
+  text_batch_size: 256
+  image_batch_size: 64
+  similarity_query_batch_size: 256
+  max_length: 52
+  merged_candidate_pool: true
+  submission_top_k: 10
+  output_dir: outputs/finetune_lora/evaluation
+  report_path: outputs/finetune_lora/evaluation/valid_metrics.json
