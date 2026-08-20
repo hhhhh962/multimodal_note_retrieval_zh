@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import time
@@ -32,9 +33,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--embedding_dir", default="outputs/finetuned_docs_v2")
     parser.add_argument("--output_dir", default=None)
-    parser.add_argument("--chunk_size", type=int, default=50000)
+    parser.add_argument("--chunk_size", type=int, default=5000)
     parser.add_argument("--hnsw_m", type=int, default=DEFAULT_HNSW_M)
     parser.add_argument("--ef_construction", type=int, default=DEFAULT_EF_CONSTRUCTION)
+    parser.add_argument(
+        "--faiss_threads",
+        type=int,
+        default=int(os.environ.get("FAISS_NUM_THREADS", "1")),
+        help="FAISS/OpenMP 构建线程数；小内存机器默认 1",
+    )
     parser.add_argument("--replace_existing", action="store_true")
     # Retained for CLI compatibility; benchmarking is now an explicit separate step.
     parser.add_argument("--benchmark_sample_size", type=int, default=DEFAULT_SAMPLE_SIZE)
@@ -43,7 +50,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    for name in ("chunk_size", "hnsw_m", "ef_construction"):
+    for name in ("chunk_size", "hnsw_m", "ef_construction", "faiss_threads"):
+        if not hasattr(args, name):
+            continue
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"{name} 必须是正整数")
     if hasattr(args, "benchmark_sample_size") and int(args.benchmark_sample_size) <= 0:
@@ -122,9 +131,15 @@ def build_one(
     if int(index.ntotal) != count:
         raise RuntimeError("HNSW ntotal 与 embedding 数量不一致")
     faiss.write_index(index, str(index_path))
+    del index
+    gc.collect()
     loaded = faiss.read_index(str(index_path))
+    if int(loaded.ntotal) != count or int(loaded.d) != dimension:
+        raise RuntimeError("HNSW 重载后的 count/dimension 不一致")
     loaded.hnsw.efSearch = FIXED_EF_SEARCH
     faiss.write_index(loaded, str(index_path))
+    del loaded
+    gc.collect()
     return {
         "count": count,
         "dimension": dimension,
@@ -137,6 +152,7 @@ def build_one(
 def main() -> int:
     args = parse_args()
     validate_args(args)
+    faiss.omp_set_num_threads(int(args.faiss_threads))
     embedding_dir = Path(args.embedding_dir)
     output_dir = Path(args.output_dir or args.embedding_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

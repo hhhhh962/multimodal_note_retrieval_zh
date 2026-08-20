@@ -16,7 +16,8 @@ mkdir -p logs "$OUTPUT_DIR"
 # 后台启动全量索引构建任务。
 nohup "$PYTHON" -u src/build_faiss_index.py \
   --embedding_dir "$OUTPUT_DIR" \
-  --chunk_size 50000 \
+  --chunk_size 5000 \
+  --faiss_threads 1 \
   --hnsw_m 32 \
   --ef_construction 200 \
   --replace_existing \

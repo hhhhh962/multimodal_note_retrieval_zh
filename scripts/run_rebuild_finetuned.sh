@@ -71,7 +71,8 @@ nohup bash -c '
     "$python_bin" -u src/build_faiss_index.py \
       --embedding_dir "$output_dir" \
       --output_dir "$output_dir" \
-      --chunk_size 50000 \
+      --chunk_size 5000 \
+      --faiss_threads 1 \
       --hnsw_m 32 \
       --ef_construction 200 \
       --replace_existing
