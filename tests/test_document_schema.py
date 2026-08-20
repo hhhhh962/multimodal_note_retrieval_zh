@@ -136,6 +136,18 @@ class PairMigrationTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 migrate(source, output)
 
+    def test_explicit_tolerance_records_nonidentical_duplicate_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._write_source(root)
+            text = np.load(source / "text_embeddings.npy")
+            text[1] = normalized([[1.0, 0.0001, 0.0]])[0]
+            np.save(source / "text_embeddings.npy", text)
+            report = migrate(source, root / "v2", atol=5e-4)
+            self.assertEqual(report["nonidentical_text_rows_within_atol"], 1)
+            self.assertGreater(report["max_duplicate_text_abs_diff"], 0.0)
+            self.assertEqual(report["nonidentical_image_rows_within_atol"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

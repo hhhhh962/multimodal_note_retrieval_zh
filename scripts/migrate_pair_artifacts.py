@@ -33,7 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--items", type=Path, default=None, help="旧 pair-level items.jsonl；全量迁移建议显式传入")
-    parser.add_argument("--atol", type=float, default=1e-6)
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=1e-6,
+        help="重复向量逐元素绝对误差上限；默认严格使用 1e-6，放宽时会在报告中记录实际漂移",
+    )
     return parser.parse_args()
 
 
@@ -170,31 +175,45 @@ def migrate(
         seen_images = np.zeros(len(image_assets), dtype=np.bool_)
         duplicate_text_rows = 0
         duplicate_image_rows = 0
+        nonidentical_text_rows = 0
+        nonidentical_image_rows = 0
+        max_duplicate_text_abs_diff = 0.0
+        max_duplicate_image_abs_diff = 0.0
 
         for pair_row, (doc_row, image_row) in enumerate(zip(pair_doc_rows, pair_image_rows)):
             text_vector = np.asarray(source_text[pair_row], dtype="float32")
             image_vector = np.asarray(source_image[pair_row], dtype="float32")
+            if not np.isfinite(text_vector).all() or not np.isfinite(image_vector).all():
+                raise ValueError(f"旧向量包含 NaN/Inf：pair_row={pair_row}")
             if not seen_docs[doc_row]:
                 target_text[doc_row] = text_vector
                 seen_docs[doc_row] = True
-            elif not np.allclose(target_text[doc_row], text_vector, rtol=0.0, atol=atol):
-                max_diff = float(np.max(np.abs(target_text[doc_row] - text_vector)))
-                raise ValueError(
-                    f"同一文档的重复文本向量不一致：pair_row={pair_row} doc_row={doc_row} max_diff={max_diff}"
-                )
             else:
                 duplicate_text_rows += 1
+                max_diff = float(np.max(np.abs(target_text[doc_row] - text_vector)))
+                max_duplicate_text_abs_diff = max(max_duplicate_text_abs_diff, max_diff)
+                if max_diff > 0.0:
+                    nonidentical_text_rows += 1
+                if max_diff > atol:
+                    raise ValueError(
+                        f"同一文档的重复文本向量不一致：pair_row={pair_row} "
+                        f"doc_row={doc_row} max_diff={max_diff} atol={atol}"
+                    )
 
             if not seen_images[image_row]:
                 target_image[image_row] = image_vector
                 seen_images[image_row] = True
-            elif not np.allclose(target_image[image_row], image_vector, rtol=0.0, atol=atol):
-                max_diff = float(np.max(np.abs(target_image[image_row] - image_vector)))
-                raise ValueError(
-                    f"同一路径的重复图片向量不一致：pair_row={pair_row} image_row={image_row} max_diff={max_diff}"
-                )
             else:
                 duplicate_image_rows += 1
+                max_diff = float(np.max(np.abs(target_image[image_row] - image_vector)))
+                max_duplicate_image_abs_diff = max(max_duplicate_image_abs_diff, max_diff)
+                if max_diff > 0.0:
+                    nonidentical_image_rows += 1
+                if max_diff > atol:
+                    raise ValueError(
+                        f"同一路径的重复图片向量不一致：pair_row={pair_row} "
+                        f"image_row={image_row} max_diff={max_diff} atol={atol}"
+                    )
 
         if not bool(seen_docs.all()) or not bool(seen_images.all()):
             raise RuntimeError("迁移结束后仍有文档或图片向量未写入")
@@ -227,6 +246,10 @@ def migrate(
             "relation_count": meta["relation_count"],
             "duplicate_text_rows_validated": duplicate_text_rows,
             "duplicate_image_rows_validated": duplicate_image_rows,
+            "nonidentical_text_rows_within_atol": nonidentical_text_rows,
+            "nonidentical_image_rows_within_atol": nonidentical_image_rows,
+            "max_duplicate_text_abs_diff": max_duplicate_text_abs_diff,
+            "max_duplicate_image_abs_diff": max_duplicate_image_abs_diff,
             "atol": atol,
         }
         write_json(temporary / "migration_report.json", report)
