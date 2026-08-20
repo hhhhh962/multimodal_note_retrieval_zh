@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import gc
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -255,6 +256,26 @@ def trim_allocator() -> None:
         pass
 
 
+def drop_benchmark_file_cache(embedding_dir: Path, index_dir: Path) -> None:
+    """Advise Linux to reclaim read-only benchmark pages between low-memory batches."""
+
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        return
+    for path in (
+        index_dir / "text.index",
+        index_dir / "image.index",
+        embedding_dir / "text_embeddings.npy",
+        embedding_dir / "image_embeddings.npy",
+    ):
+        if not path.is_file():
+            continue
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(descriptor)
+
+
 def benchmark_in_batches(
     embedding_dir: Path,
     index_dir: Path,
@@ -278,6 +299,7 @@ def benchmark_in_batches(
         reports.append(report)
         offset += int(report["sample_size"])
         trim_allocator()
+        drop_benchmark_file_cache(embedding_dir, index_dir)
         print(f"benchmark batch complete: {offset}/{sample_size}", flush=True)
         if int(report["sample_size"]) < current_size:
             break
