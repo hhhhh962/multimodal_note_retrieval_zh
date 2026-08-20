@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -146,7 +148,14 @@ def build_one(
     if int(index.ntotal) != count:
         raise RuntimeError("HNSW ntotal 与 embedding 数量不一致")
     if low_memory_build:
-        index = assemble_flat_hnsw(index, embeddings, dimension, hnsw_m, count)
+        index = assemble_flat_hnsw(
+            index,
+            embeddings,
+            dimension,
+            hnsw_m,
+            count,
+            index_path.with_name(f".{embedding_path.stem}.hnsw_graph.tmp"),
+        )
     faiss.write_index(index, str(index_path))
     del index
     gc.collect()
@@ -174,6 +183,7 @@ def assemble_flat_hnsw(
     dimension: int,
     hnsw_m: int,
     count: int,
+    scratch_dir: Path,
 ) -> faiss.Index:
     """Move an SQ-built graph into a serializable float32 IndexHNSWFlat."""
 
@@ -192,34 +202,55 @@ def assemble_flat_hnsw(
         "check_relative_distance",
         "search_bounded_queue",
     )
-    graph_scalars = {name: getattr(graph_index.hnsw, name) for name in scalar_fields}
-    graph_storage = faiss.downcast_index(graph_index.storage)
-    graph_storage.reset()
-    gc.collect()
-    graph_vectors = {
-        name: faiss.vector_to_array(getattr(graph_index.hnsw, name)) for name in vector_fields
-    }
-    del graph_index
-    gc.collect()
+    if scratch_dir.exists():
+        raise FileExistsError(f"发现遗留 HNSW 图临时目录：{scratch_dir}")
+    scratch_dir.mkdir(parents=True)
+    try:
+        graph_scalars = {name: getattr(graph_index.hnsw, name) for name in scalar_fields}
+        graph_storage = faiss.downcast_index(graph_index.storage)
+        graph_storage.reset()
+        del graph_storage
+        trim_allocator()
+        print("临时 SQ 向量已释放，正在把 HNSW 邻接图逐字段转存到磁盘", flush=True)
+        for name in vector_fields:
+            values = faiss.vector_to_array(getattr(graph_index.hnsw, name))
+            np.save(scratch_dir / f"{name}.npy", values)
+            del values
+            trim_allocator()
+        del graph_index
+        trim_allocator()
 
-    final = faiss.IndexHNSWFlat(dimension, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
-    storage = faiss.downcast_index(final.storage)
-    for start in range(0, count, 5000):
-        end = min(start + 5000, count)
-        storage.add(np.ascontiguousarray(embeddings[start:end], dtype="float32"))
-    if int(storage.ntotal) != count:
-        raise RuntimeError("装配后的 IndexFlat 存储数量不一致")
-    final.ntotal = count
-    for name in list(graph_vectors):
-        values = graph_vectors.pop(name)
-        faiss.copy_array_to_vector(values, getattr(final.hnsw, name))
-        del values
-        gc.collect()
-    for name, value in graph_scalars.items():
-        setattr(final.hnsw, name, value)
-    if int(final.hnsw.offsets.size()) != count + 1:
-        raise RuntimeError("装配后的 HNSW offsets 数量不一致")
-    return final
+        print("正在装配标准 float32 IndexHNSWFlat", flush=True)
+        final = faiss.IndexHNSWFlat(dimension, int(hnsw_m), faiss.METRIC_INNER_PRODUCT)
+        storage = faiss.downcast_index(final.storage)
+        for start in range(0, count, 5000):
+            end = min(start + 5000, count)
+            storage.add(np.ascontiguousarray(embeddings[start:end], dtype="float32"))
+        if int(storage.ntotal) != count:
+            raise RuntimeError("装配后的 IndexFlat 存储数量不一致")
+        final.ntotal = count
+        for name in vector_fields:
+            values = np.load(scratch_dir / f"{name}.npy", mmap_mode="r")
+            faiss.copy_array_to_vector(values, getattr(final.hnsw, name))
+            del values
+            trim_allocator()
+        for name, value in graph_scalars.items():
+            setattr(final.hnsw, name, value)
+        if int(final.hnsw.offsets.size()) != count + 1:
+            raise RuntimeError("装配后的 HNSW offsets 数量不一致")
+        return final
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def trim_allocator() -> None:
+    """Return freed C/C++ heap pages to the OS when glibc exposes malloc_trim."""
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def main() -> int:
