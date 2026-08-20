@@ -81,6 +81,15 @@ def _validate_source_arrays(
         raise ValueError(f"旧 image_embeddings shape={image_embeddings.shape}，期望 {expected}")
 
 
+def normalized_vector(vector: np.ndarray, pair_row: int, label: str) -> tuple[np.ndarray, float]:
+    if not np.isfinite(vector).all():
+        raise ValueError(f"旧{label}向量包含 NaN/Inf：pair_row={pair_row}")
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError(f"旧{label}向量范数无效：pair_row={pair_row} norm={norm}")
+    return np.asarray(vector / norm, dtype="float32"), norm
+
+
 def iter_jsonl(path: Path):
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -179,12 +188,22 @@ def migrate(
         nonidentical_image_rows = 0
         max_duplicate_text_abs_diff = 0.0
         max_duplicate_image_abs_diff = 0.0
+        source_text_norm_min = float("inf")
+        source_text_norm_max = 0.0
+        source_image_norm_min = float("inf")
+        source_image_norm_max = 0.0
 
         for pair_row, (doc_row, image_row) in enumerate(zip(pair_doc_rows, pair_image_rows)):
-            text_vector = np.asarray(source_text[pair_row], dtype="float32")
-            image_vector = np.asarray(source_image[pair_row], dtype="float32")
-            if not np.isfinite(text_vector).all() or not np.isfinite(image_vector).all():
-                raise ValueError(f"旧向量包含 NaN/Inf：pair_row={pair_row}")
+            text_vector, text_norm = normalized_vector(
+                np.asarray(source_text[pair_row], dtype="float32"), pair_row, "文本"
+            )
+            image_vector, image_norm = normalized_vector(
+                np.asarray(source_image[pair_row], dtype="float32"), pair_row, "图片"
+            )
+            source_text_norm_min = min(source_text_norm_min, text_norm)
+            source_text_norm_max = max(source_text_norm_max, text_norm)
+            source_image_norm_min = min(source_image_norm_min, image_norm)
+            source_image_norm_max = max(source_image_norm_max, image_norm)
             if not seen_docs[doc_row]:
                 target_text[doc_row] = text_vector
                 seen_docs[doc_row] = True
@@ -251,6 +270,9 @@ def migrate(
             "nonidentical_image_rows_within_atol": nonidentical_image_rows,
             "max_duplicate_text_abs_diff": max_duplicate_text_abs_diff,
             "max_duplicate_image_abs_diff": max_duplicate_image_abs_diff,
+            "source_text_norm_minmax": [source_text_norm_min, source_text_norm_max],
+            "source_image_norm_minmax": [source_image_norm_min, source_image_norm_max],
+            "output_l2_renormalized": True,
             "atol": atol,
         }
         write_json(temporary / "migration_report.json", report)
